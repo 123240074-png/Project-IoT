@@ -7,8 +7,8 @@ Proyek IoT Pengukuran Tinggi Badan & Deteksi Objek Universal berbasis **ESP32 De
 Seluruh kode sumber proyek berada pada folder [`cocomang/`](./cocomang/):
 
 - **[`cocomang/dist/`](./cocomang/dist/)**: Aplikasi frontend Web Serial live dashboard (vanilla ES Modules).
-- **[`cocomang/firmware/`](./cocomang/firmware/)**: Firmware sketch Arduino untuk ESP32 (`smartheight_live_stream.ino`).
-- **[`cocomang/tests/`](./cocomang/tests/)**: Automated test suite Node.js (74 unit test lulus).
+- **[`cocomang/firmware/`](./cocomang/firmware/)**: Firmware sketch Arduino untuk ESP32 (`smartheight_progres2_dual_rfid/smartheight_progres2_dual_rfid.ino`) yang mendukung Dual MFRC522 (VSPI & HSPI), HC-SR04, dan Buzzer Pasif.
+- **[`cocomang/tests/`](./cocomang/tests/)**: Automated test suite Node.js (10 unit test lulus).
 - **[`cocomang/docs/`](./cocomang/docs/)**: Dokumentasi pengujian physical layer.
 - **[`cocomang/README.md`](./cocomang/README.md)**: Panduan lengkap instalasi, wiring diagram, dan cara menjalankan server lokal.
 - **[`cocomang/DESIGN.md`](./cocomang/DESIGN.md)**: Arsitektur desain sistem & protokol komunikasi.

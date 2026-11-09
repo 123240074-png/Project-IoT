@@ -44,7 +44,7 @@ Dashboard pengujian physical layer untuk proyek Smart Height Measurement. Versi 
 
 ## Mengatur firmware
 
-Buka `firmware/smartheight_live_stream.ino` dengan Arduino IDE. Firmware tidak membutuhkan `LiquidCrystal_I2C.h`; pengendalian LCD PCF8574 dilakukan dengan `Wire.h`.
+Buka `firmware/smartheight_progres2_dual_rfid/smartheight_progres2_dual_rfid.ino` dengan Arduino IDE. Firmware mendukung Dual SPI MFRC522 (VSPI & HSPI), HC-SR04, dan Buzzer Pasif.
 
 Periksa nilai berikut sebelum pengujian manusia:
 
@@ -80,7 +80,7 @@ Buka `http://localhost:8000` menggunakan Chrome atau Edge desktop. Jangan membuk
 
 ## Menghubungkan ESP32
 
-1. Pastikan firmware `smartheight_live_stream.ino` sudah diunggah.
+1. Pastikan firmware `smartheight_progres2_dual_rfid.ino` sudah diunggah.
 2. Sebelum upload firmware, putuskan koneksi website melalui tombol **Putuskan**. Sebelum menghubungkan website, tutup Serial Monitor Arduino IDE. Port COM biasanya hanya dapat dibuka oleh satu aplikasi pada satu waktu.
 3. Buka menu **Pengukuran live** pada COCOMANG.
 4. Klik **Hubungkan ESP32**.
@@ -88,28 +88,11 @@ Buka `http://localhost:8000` menggunakan Chrome atau Edge desktop. Jangan membuk
 6. Dashboard harus menunjukkan **Data live diterima** serta nilai jarak dan tinggi.
 7. Untuk pengukuran tinggi, tambahkan pengunjung secara manual pada menu Pengunjung, pilih namanya, lalu klik **Simpan hasil live**.
 8. Nama, usia, jenis kelamin, dan berat badan adalah data manual/opsional. Tinggi badan hanya berasal dari pembacaan sensor, bukan input operator.
-9. Untuk pengujian objek, pilih tab **Deteksi objek**, atur target, mulai pengujian, lalu isi jarak aktual dari meteran sebelum mencatat snapshot.
-
 Jika browser tidak menawarkan daftar COM, cek kabel USB data, driver USB-serial, dan apakah Serial Monitor atau aplikasi lain masih menggunakan port tersebut.
-
-## Mode deteksi objek universal & konfigurasi 6 arah
-
-- Mode ini memakai frame serial yang sama; firmware, wiring, dan format JSON tidak berubah.
-- **Konfigurasi 6 Arah Pengujian (Manual):** Mendukung 6 pilihan arah: **UP (Atas / Y+)**, **DOWN (Bawah / Y−)**, **LEFT (Kiri / X−)**, **RIGHT (Kanan / X+)**, **FRONT (Depan / Z+)**, dan **BACK (Belakang / Z−)**.
-- **Peringatan Batasan Hardware:** Perangkat keras hanya memiliki 1 unit sensor HC-SR04. Pilihan arah adalah konfigurasi diagram pengujian manual, bukan deteksi multi-sensor simultan. Operator harus menyesuaikan orientasi fisik sensor secara manual menghadap target sesuai arah yang dipilih. Sensor hanya mengukur jarak 1D sepanjang garis pancaran dan tidak mengukur koordinat lateral atau posisi spasial 3D.
-- **Visualisasi 3D Isometrik SVG:** Menggunakan proyeksi isometrik dengan sumbu koordinat X, Y, Z, orientasi sensor HC-SR04 dual transduser (Tx dan Rx), kerucut pancaran ultrasonik, dan target universal berupa kubus/balok geometris (bebas dari representasi anatomi manusia/tangan).
-- **Kontrol Posisi Target:** Posisi visual target dapat dialihkan antara pembacaan *Live sensor* (`distanceCm`) atau *Preset target* (30, 40, 50, atau 60 cm).
-- Target rentang awal adalah 20–60 cm dengan toleransi kestabilan 2 cm dan 5 sampel valid berturut-turut.
-- Tombol **Mulai pengujian** mengosongkan buffer. Status berubah menjadi `COLLECTING`, `STABLE`, `UNSTABLE`, `NO_OBJECT`, `INVALID`, atau `DEVICE_OFFLINE` sesuai data frame.
-- Isi **Jarak aktual dari meteran** secara manual. Jangan menyalin angka sensor. Error dihitung sebagai `terukur − aktual`.
-- **Catat hasil pengujian** menyimpan snapshot (beserta arah pengujian aktif) setelah pengujian dimulai dan data aktual tersedia.
-- Dataset pengujian objek disimpan pada `cocomang-object-tests-v1`, terpisah dari `cocomang-live-v1`. Maksimum 500 hasil terbaru; CSV dataset dapat diunduh dari panel dataset.
-- Mode ini bukan computer vision atau pelacak koordinat 3D. Pengukuran tinggi badan tetap menggunakan sensor menghadap ke bawah dan rumus standar.
 
 ## Riwayat dan PDF
 
 - Riwayat pengunjung hanya bertambah saat petugas menekan **Simpan hasil live** pada mode pengukuran tinggi.
-- Snapshot mode deteksi objek tidak masuk riwayat pengunjung; gunakan tombol **Ekspor CSV** pada panel dataset kalibrasi.
 - Data disimpan pada `localStorage` browser di perangkat tersebut. Tidak ada cloud sync atau Firebase pada tahap ini.
 - CSV dapat diunduh langsung.
 - Tombol **Cetak / Simpan PDF** membuka halaman laporan. Pada dialog cetak Chrome/Edge pilih printer **Save as PDF / Simpan sebagai PDF**.
@@ -122,7 +105,7 @@ npm test
 npm run check
 ```
 
-Tes Node memvalidasi model data, parser serial, state machine deteksi objek, visualisasi 6 arah isometrik, penyimpanan dataset terpisah, dan CSV. Saat ini 74 test lulus. Pengujian browser dan perangkat fisik dijelaskan di `QA.md`.
+Tes Node memvalidasi model data, repository localStorage, dan parser protokol serial ESP32. Saat ini 10 test lulus. Pengujian browser dan perangkat fisik dijelaskan di `QA.md`.
 
 ## Batasan dan status verifikasi
 
@@ -131,5 +114,4 @@ Tes Node memvalidasi model data, parser serial, state machine deteksi objek, vis
 - Website tidak dapat membaca COM port dari Safari/Firefox atau halaman `file://`.
 - Firmware dan website harus memakai protokol JSON dan baud rate 115200 yang sama.
 - Hasil tinggi tetap berupa estimasi prototipe. Validasi reference height, offset, posisi sensor, dan perbandingan dengan alat ukur perlu dilakukan secara fisik sebelum menyimpulkan akurasi.
-- Deteksi objek memakai echo ultrasonik dengan target kubus geometris universal, bukan pengenalan tangan, anatomi manusia, atau kamera. Satu sensor hanya mengukur jarak 1D sepanjang arah pancaran. Operator harus menyesuaikan orientasi fisik sensor secara manual.
 - Buzzer dikendalikan firmware. Dashboard hanya menampilkan status ambang yang dikirim ESP32.

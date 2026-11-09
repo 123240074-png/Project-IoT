@@ -1,16 +1,5 @@
 import { repository, addVisitor, recordMeasurement, csvExport } from './data.mjs';
 import { parseDeviceLine } from './serial-protocol.mjs';
-import { OBJECT_DEFAULTS, evaluateObjectDetection, objectError, validateObjectRange } from './object-detection.mjs';
-import { OBJECT_TESTS_STORAGE_KEY, appendObjectTest, createEmptyObjectTests, createObjectTestResult, loadObjectTests, objectTestsCsv } from './object-tests.mjs';
-import {
-  OBJECT_DIRECTIONS,
-  DEFAULT_OBJECT_DIRECTION,
-  DEFAULT_OBJECT_POSITION_MODE,
-  normalizeObjectDirection,
-  objectDirectionMeta,
-  normalizeObjectPositionMode,
-  renderObjectSvg,
-} from './object-direction.mjs';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -45,18 +34,6 @@ let historySearch = '';
 let historyStatus = 'all';
 let historyCalibration = 'all';
 let historySort = 'newest';
-let measurementMode = 'height';
-let objectSettings = { minCm: OBJECT_DEFAULTS.minCm, maxCm: OBJECT_DEFAULTS.maxCm, toleranceCm: OBJECT_DEFAULTS.toleranceCm, sampleCount: OBJECT_DEFAULTS.sampleCount };
-let objectDistances = [];
-let objectLastSequence = null;
-let objectTestStartedAt = 0;
-let objectResult = null;
-let objectRecorded = false;
-let objectTargetCm = '';
-let objectActualCm = '';
-let objectDirection = DEFAULT_OBJECT_DIRECTION;
-let objectPositionMode = DEFAULT_OBJECT_POSITION_MODE;
-let objectTests = createEmptyObjectTests();
 const modal = $('#modal');
 
 function toast(message, error = false) {
@@ -275,390 +252,9 @@ function visitorOptions() {
   return state.visitors.map(visitor => `<option value="${escape(visitor.id)}" ${visitor.id === selectedVisitorId ? 'selected' : ''}>${escape(visitor.name)}${visitor.age ? ` · ${visitor.age} th` : ''}</option>`).join('');
 }
 
-function measurementModeBar() {
-  const objectMode = measurementMode === 'object';
-  return `<div class="measurement-mode-bar">
-    <div class="mode-tabs" role="group" aria-label="Mode pengukuran live">
-      <button type="button" class="mode-tab" data-action="measurement-mode" data-mode="height" aria-pressed="${objectMode ? 'false' : 'true'}">Pengukuran tinggi</button>
-      <button type="button" class="mode-tab" data-action="measurement-mode" data-mode="object" aria-pressed="${objectMode ? 'true' : 'false'}">Deteksi objek</button>
-    </div>
-    <p class="mode-note">${objectMode ? 'Pengujian objek universal dengan HC-SR04 (6 arah pengujian manual) dan tidak menambah riwayat pengunjung.' : 'Mode pengukuran tinggi tetap menjadi alur penyimpanan pengunjung.'}</p>
-  </div>`;
-}
-
-function objectDetectionText(code) {
-  return ({
-    IN_RANGE: 'Dalam rentang target',
-    TOO_CLOSE: 'Terlalu dekat',
-    TOO_FAR: 'Terlalu jauh',
-    INVALID: 'Echo tidak valid',
-    WAITING: 'Menunggu data',
-    OFFLINE: 'Perangkat offline',
-  })[code] || 'Menunggu data';
-}
-
-function objectStatusView(result, started) {
-  const detection = objectDetectionText(result?.detectionStatus);
-  const detectionTone = ({
-    IN_RANGE: 'good',
-    TOO_CLOSE: 'alarm',
-    TOO_FAR: 'waiting',
-    INVALID: 'alarm',
-    WAITING: 'waiting',
-    OFFLINE: 'alarm',
-  })[result?.detectionStatus] || 'waiting';
-  const common = { detection, detectionTone };
-  if (!serialSession) {
-    return { ...common, stability:'DEVICE_OFFLINE', tone:'alarm', note:'Hubungkan ESP32 untuk mulai menerima echo sensor.' };
-  }
-  if (result?.status === 'DEVICE_OFFLINE') {
-    return { ...common, stability:'DEVICE_OFFLINE', tone:'alarm', note:'Data sensor tidak diperbarui lebih dari 3 detik. Buffer pengujian dikosongkan.' };
-  }
-  if (!started) {
-    if (result?.status === 'INVALID') {
-      return { ...common, stability:'INVALID', tone:'alarm', note:'Echo tidak valid. Periksa posisi sensor dan objek, lalu mulai pengujian.' };
-    }
-    if (result?.detectionStatus === 'TOO_CLOSE' || result?.detectionStatus === 'TOO_FAR') {
-      return { ...common, stability:'NO_OBJECT', tone:'waiting', note:`Pratinjau berada di luar rentang ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm. Tekan Mulai pengujian untuk mencoba.` };
-    }
-    if (!result || result.detectionStatus === 'WAITING') {
-      return { ...common, stability:'NO_OBJECT', tone:'waiting', note:'Menunggu baris data dari ESP32. Tekan Mulai pengujian setelah echo terbaca.' };
-    }
-    return { ...common, stability:'SIAP DIMULAI', tone:'waiting', note:'Echo valid terdeteksi. Tekan Mulai pengujian untuk mengumpulkan 5 sampel.' };
-  }
-  if (result?.status === 'INVALID') {
-    return { ...common, stability:'INVALID', tone:'alarm', note:'Echo tidak valid. Buffer pengujian dikosongkan; tunggu pembacaan valid berikutnya.' };
-  }
-  if (result?.status === 'NO_OBJECT' && result.detectionStatus === 'WAITING') {
-    return { ...common, stability:'NO_OBJECT', tone:'waiting', note:'Menunggu baris data dari ESP32 sebelum mengambil sampel baru.' };
-  }
-  if (result?.status === 'NO_OBJECT') {
-    return { ...common, stability:'NO_OBJECT', tone: result.detectionStatus === 'TOO_CLOSE' ? 'alarm' : 'waiting', note:`Objek di luar rentang ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm. Buffer dikosongkan.` };
-  }
-  if (result?.status === 'STABLE') {
-    return { ...common, stability:'STABLE', tone:'good', note:`Rentang ${fmt(result.stabilityRangeCm)} cm dalam toleransi ${fmt(result.toleranceCm)} cm.` };
-  }
-  if (result?.status === 'UNSTABLE') {
-    return { ...common, stability:'UNSTABLE', tone:'waiting', note:`Rentang ${fmt(result.stabilityRangeCm)} cm melebihi toleransi ${fmt(result.toleranceCm)} cm. Ulangi pengujian.` };
-  }
-  if (result?.status === 'COLLECTING') {
-    return { ...common, stability:'COLLECTING', tone:'waiting', note:`${result.sampleCount}/${result.sampleTarget} sampel. Pertahankan posisi objek tetap diam di area target.` };
-  }
-  return { ...common, stability:'NO_OBJECT', tone:'waiting', note:'Menunggu data sensor.' };
-}
-
-function directionSelector() {
-  const meta = objectDirectionMeta(objectDirection);
-  const cards = OBJECT_DIRECTIONS.map(dir => {
-    const isActive = dir.code === objectDirection;
-    return `<button type="button" class="direction-card ${isActive ? 'is-active' : ''}" data-action="object-direction" data-direction="${dir.code}" aria-pressed="${isActive}">
-      <div class="direction-card-top"><span class="direction-arrow">${dir.arrow}</span><span class="direction-axis-badge">${dir.axisCode}</span></div>
-      <span class="direction-title">${dir.label}</span>
-      <span class="direction-code">${dir.code}</span>
-      <span class="direction-hint">${dir.hint}</span>
-    </button>`;
-  }).join('');
-  return `<div class="direction-selector-wrapper">
-    <div class="direction-header">
-      <span class="direction-kicker">Arah Pengujian Sensor</span>
-      <p class="direction-status-text">Arah aktif: <strong>${meta.label} (${meta.axisCode})</strong> &mdash; ${meta.waveDirection}</p>
-    </div>
-    <div class="direction-grid" role="group" aria-label="Pilihan arah pengujian sensor">${cards}</div>
-    <div class="object-hardware-warning">
-      <span class="warning-badge">${svg('info')} HARDWARE</span>
-      <p class="warning-message">Orientasi fisik sensor HC-SR04 <strong>harus disesuaikan secara manual</strong> oleh operator. Satu sensor hanya mengukur jarak 1D sepanjang arah pancaran. Enam pilihan arah adalah konfigurasi pengujian, bukan enam sensor simultan.</p>
-    </div>
-  </div>`;
-}
-
-function objectVisualization() {
-  const vizState = !serialSession ? 'offline' : 'idle';
-  const liveD = latestFrame?.status === 'ok' ? latestFrame.distanceCm : null;
-  const svgContent = renderObjectSvg({
-    direction: objectDirection,
-    liveDistanceCm: liveD,
-    targetDistanceCm: Number(objectTargetCm) || null,
-    minCm: objectSettings.minCm,
-    maxCm: objectSettings.maxCm,
-    positionMode: objectPositionMode,
-    state: vizState,
-  });
-  return `<div class="object-visual">
-    <div class="object-viz" id="object-viz" data-state="${vizState}" data-direction="${objectDirection}">
-      ${svgContent}
-    </div>
-    <p class="object-viz-caption"><span>Objek target universal. Bukan computer vision. HC-SR04 hanya mengukur jarak 1D.</span><strong id="object-viz-state">${vizState.toUpperCase()}</strong></p>
-  </div>`;
-}
-
-function objectControlPanel() {
-  const started = Boolean(objectTestStartedAt);
-  const capture = objectCaptureState();
-  const presets = [30, 40, 50, 60].map(value => `<button type="button" class="preset-btn ${String(Number(objectTargetCm)) === String(value) ? 'is-active' : ''}" data-action="object-preset" data-cm="${value}">${value} cm</button>`).join('');
-  return `<section class="panel object-control-panel">
-    <div class="panel-header"><div><p class="eyebrow">Kontrol pengujian</p><h2>Snapshot hasil objek</h2><p>Isi jarak aktual dari meteran; error dihitung dari selisih jarak sensor.</p></div></div>
-    <div class="object-control-body">
-      <div class="field">
-        <label for="object-target">Jarak target pengujian (cm)</label>
-        <input id="object-target" type="number" min="1" max="400" step="0.1" inputmode="decimal" placeholder="30, 40, 50, atau 60" value="${escape(objectTargetCm)}">
-        <div class="object-presets" aria-label="Pilihan jarak target">${presets}</div>
-      </div>
-      <div class="field object-actual-desktop">
-        <label for="object-actual">Jarak aktual dari meteran (cm) <span class="req">*</span></label>
-        <input id="object-actual" type="number" min="1" max="400" step="0.1" inputmode="decimal" placeholder="Hasil ukur meteran" value="${escape(objectActualCm)}">
-        <p class="field-help">Jangan mengisi angka dari sensor. Jarak aktual wajib diukur manual.</p>
-      </div>
-      <div class="field-row object-range-fields">
-        <div class="field"><label for="object-min">Batas minimum (cm)</label><input id="object-min" type="number" min="2" max="399" step="0.1" value="${objectSettings.minCm}"></div>
-        <div class="field"><label for="object-max">Batas maksimum (cm)</label><input id="object-max" type="number" min="3" max="400" step="0.1" value="${objectSettings.maxCm}"></div>
-      </div>
-      <p class="field-help">Stabilitas memakai 5 sampel valid berturut-turut dengan toleransi ${fmt(objectSettings.toleranceCm)} cm.</p>
-      <div class="capture-readout object-summary" aria-label="Ringkasan pengujian objek">
-        <div class="capture-row"><span>Jarak target</span><strong id="object-target-summary">- cm</strong></div>
-        <div class="capture-row"><span>Jarak aktual meteran</span><strong id="object-actual-summary">- cm</strong></div>
-        <div class="capture-row"><span>Error (terukur - aktual)</span><strong id="object-error">- cm</strong></div>
-        <div class="capture-row"><span>Durasi pengujian</span><strong id="object-duration">-</strong></div>
-      </div>
-      <div class="object-actions">
-        <button class="btn primary" id="object-start" data-action="object-start" ${!serialSession || started ? 'disabled' : ''}>Mulai pengujian</button>
-        <button class="btn" id="object-repeat" data-action="object-repeat" ${!serialSession || !started ? 'disabled' : ''}>Ulangi pengujian</button>
-        <button class="btn" id="object-reset" data-action="object-reset" ${!started && !objectTargetCm && !objectActualCm ? 'disabled' : ''}>Reset pengujian</button>
-      </div>
-      <button class="btn primary full object-record" data-action="object-record" id="object-record" ${capture.ready ? '' : 'disabled'}>${svg('check')} Catat hasil pengujian</button>
-      <p class="object-capture-state" id="object-capture-state">${capture.label}</p>
-      <details class="object-technical">
-        <summary>Lihat detail teknis</summary>
-        <dl class="object-tech-grid">
-          <div><dt>Urutan frame</dt><dd id="object-tech-sequence">-</dd></div>
-          <div><dt>Status frame</dt><dd id="object-tech-frame">-</dd></div>
-          <div><dt>Buffer sampel</dt><dd id="object-tech-buffer">-</dd></div>
-          <div><dt>Rentang target</dt><dd id="object-tech-range">${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm</dd></div>
-          <div><dt>Toleransi</dt><dd id="object-tech-tolerance">${fmt(objectSettings.toleranceCm)} cm</dd></div>
-          <div><dt>Umur data</dt><dd id="object-tech-age">-</dd></div>
-        </dl>
-        <p class="field-help">Buffer tidak disimpan per frame. Hanya snapshot yang dicatat operator yang masuk dataset.</p>
-      </details>
-    </div>
-  </section>`;
-}
-
-function objectDataset() {
-  if (!objectTests.results.length) {
-    return '<div class="empty"><strong>Belum ada hasil pengujian objek.</strong>Mulai pengujian, isi jarak aktual dari meteran, lalu catat snapshot hasil.<br><span class="small">Dataset ini terpisah dari riwayat pengunjung.</span></div>';
-  }
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="object-result-table"><caption class="sr-only">Dataset pengujian deteksi objek</caption><thead><tr><th>Waktu</th><th>Arah</th><th class="numeric">Target</th><th class="numeric">Aktual</th><th class="numeric">Terukur</th><th class="numeric">Error</th><th>Deteksi</th><th>Kestabilan</th><th class="numeric">Rentang</th><th class="numeric">Sampel</th></tr></thead><tbody>${objectTests.results.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td>${row.direction || 'DOWN'}</td><td class="numeric">${fmt(row.targetDistanceCm)} cm</td><td class="numeric">${fmt(row.actualDistanceCm)} cm</td><td class="numeric">${row.measuredDistanceCm == null ? '-' : `${fmt(row.measuredDistanceCm)} cm`}</td><td class="numeric">${row.errorCm == null ? '-' : `${fmtSigned(row.errorCm)} cm`}</td><td>${objectDetectionText(row.detectionStatus)}<span class="row-note">${row.detectionStatus}</span></td><td><span class="status ${row.stabilityStatus === 'STABLE' ? 'good' : row.stabilityStatus === 'INVALID' || row.stabilityStatus === 'DEVICE_OFFLINE' ? 'alarm' : 'waiting'}">${row.stabilityStatus}</span></td><td class="numeric">${row.stabilityRangeCm == null ? '-' : `${fmt(row.stabilityRangeCm)} cm`}</td><td class="numeric">${row.sampleCount}/5</td></tr>`).join('')}</tbody></table></div>`;
-}
-
-function objectGuidePanel() {
-  const meta = objectDirectionMeta(objectDirection);
-  return `<section class="panel guide-panel">
-    <div class="panel-header"><div><p class="eyebrow">Panduan pengujian</p><h2>Deteksi Objek Universal</h2></div><span class="guide-formula">5 sampel · toleransi ${fmt(objectSettings.toleranceCm)} cm</span></div>
-    <dl class="guide-grid">
-      <div class="guide-item"><dt>Posisi objek</dt><dd>Tempatkan objek datar (kubus, balok, atau bidang rata) pada sumbu ${meta.axisCode} di dalam rentang target ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm.</dd></div>
-      <div class="guide-item"><dt>Orientasi sensor</dt><dd>Arahkan sensor HC-SR04 secara manual ke arah ${meta.label} (${meta.code}). Enam arah pengujian adalah pilihan konfigurasi, bukan enam sensor.</dd></div>
-      <div class="guide-item"><dt>Kestabilan</dt><dd>Tahan posisi objek tanpa gerakan. Buffer direset setelah echo invalid atau objek keluar rentang.</dd></div>
-      <div class="guide-item"><dt>Jarak aktual</dt><dd>Ukur target dengan meteran dan masukkan manual. Error = jarak terukur sensor − jarak aktual.</dd></div>
-      <div class="guide-item"><dt>Batas perangkat</dt><dd>HC-SR04 hanya mengukur jarak 1D sepanjang arah pancaran. Tidak ada kamera, pengenalan objek, atau pelacakan koordinat 3D.</dd></div>
-      <div class="guide-item"><dt>Bukan multi-sensor</dt><dd>Untuk mengukur enam arah secara bersamaan, diperlukan beberapa sensor atau mekanisme pengarah. Satu HC-SR04 mengukur satu arah per pengujian.</dd></div>
-    </dl>
-    <div class="object-limit-note"><strong>Bukan computer vision.</strong> Visualisasi kubus hanya representasi posisi target. Sistem tidak mengetahui bentuk, identitas, atau posisi lateral objek.</div>
-  </section>`;
-}
-
-function objectMeasurementView() {
-  const started = Boolean(objectTestStartedAt);
-  const status = objectStatusView(objectResult, started);
-  const sampleCount = started ? objectResult?.sampleCount ?? 0 : 0;
-  const pips = Array.from({ length: OBJECT_DEFAULTS.sampleCount }, (_, index) => `<span class="object-sample-pip ${index < sampleCount ? 'filled' : ''}"></span>`).join('');
-  const dirMeta = objectDirectionMeta(objectDirection);
-  return `${directionSelector()}
-  <div class="measurement-layout object-measurement-layout">
-    <section class="panel instrument-panel object-instrument">
-      <div class="panel-header"><div><p class="instrument-kicker">Mode pengujian objek · ${dirMeta.label} (${dirMeta.axisCode})</p><h2>Deteksi Objek Universal &mdash; HC-SR04</h2><p>Echo ultrasonik · arah ${dirMeta.label} · target ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm · ${OBJECT_DEFAULTS.sampleCount} sampel</p></div>${statusPill()}</div>
-      <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${serialSession ? 'disabled' : ''}>${svg('cable')} Hubungkan ESP32</button><button class="btn" id="disconnect-device" data-action="disconnect" ${serialSession ? '' : 'disabled'}>Putuskan</button></div>
-      <p class="device-note" id="serial-help">Tutup Serial Monitor Arduino IDE sebelum menghubungkan perangkat. Objek diuji tanpa menyimpan data pengunjung.</p>
-      ${objectVisualization()}
-      <div class="object-actual-mobile">
-        <div class="field">
-          <label for="object-actual-mobile">Jarak aktual dari meteran (cm) <span class="req">*</span></label>
-          <input id="object-actual-mobile" type="number" min="1" max="400" step="0.1" inputmode="decimal" placeholder="Hasil ukur meteran" value="${escape(objectActualCm)}">
-          <p class="field-help">Jangan mengisi angka dari sensor. Jarak aktual wajib diukur manual.</p>
-        </div>
-      </div>
-      <div class="object-live-grid">
-        <div class="object-live-primary">
-          <span class="instrument-label">Jarak objek dari sensor (${dirMeta.axisCode})</span>
-          <div class="object-distance"><strong id="object-distance">-</strong><small>cm</small></div>
-          <span class="reading-meta" id="object-last">Menunggu koneksi perangkat</span>
-        </div>
-        <div class="object-live-state">
-          <span class="instrument-label">Status kestabilan</span>
-          <strong class="object-status-value ${status.tone}" id="object-stability-status">${status.stability}</strong>
-          <p class="object-status-note" id="object-status-note">${status.note}</p>
-          <div class="object-sample-pips" id="object-sample-pips" aria-label="Sampel stabil terkumpul">${pips}</div>
-        </div>
-      </div>
-      <dl class="object-metrics">
-        <div><dt>Status deteksi</dt><dd><span class="status ${status.detectionTone}" id="object-detection-status">${status.detection}</span></dd></div>
-        <div><dt>Rentang stabilitas</dt><dd id="object-range">-</dd></div>
-        <div><dt>Sampel</dt><dd id="object-samples">0/${OBJECT_DEFAULTS.sampleCount}</dd></div>
-        <div><dt>Rentang target</dt><dd id="object-target-range">${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm</dd></div>
-        <div><dt>Arah pengujian</dt><dd id="object-direction-status">${dirMeta.label} (${dirMeta.axisCode})</dd></div>
-      </dl>
-    </section>
-    ${objectControlPanel()}
-  </div>
-  ${objectGuidePanel()}
-  <section class="panel object-dataset-panel">
-    <div class="panel-header"><div><p class="eyebrow">Dataset kalibrasi</p><h2>Hasil pengujian objek <span class="count" id="object-dataset-count">${objectTests.results.length}</span></h2><p>Snapshot eksplisit, terpisah dari riwayat pengunjung.</p></div><button class="btn" data-action="export-object-csv">${svg('download')} Ekspor CSV</button></div>
-    <div id="object-dataset-region">${objectDataset()}</div>
-  </section>`;
-}
-
-function objectCaptureState() {
-  if (!objectTestStartedAt) return { ready:false, label:'Mulai pengujian terlebih dahulu.' };
-  if (objectRecorded) return { ready:false, label:'Hasil pengujian ini sudah dicatat.' };
-  if (!serialSession) return { ready:false, label:'ESP32 belum terhubung.' };
-  if (!latestFrame) return { ready:false, label:'Menunggu data sensor.' };
-  if (!lastFrameAt || Date.now() - lastFrameAt > 3000) return { ready:false, label:'Data sensor sudah kedaluwarsa.' };
-  if (!Number.isFinite(Number(objectTargetCm)) || Number(objectTargetCm) < 1 || Number(objectTargetCm) > 400) return { ready:false, label:'Isi jarak target pengujian.' };
-  if (!Number.isFinite(Number(objectActualCm)) || Number(objectActualCm) < 1 || Number(objectActualCm) > 400) return { ready:false, label:'Isi jarak aktual dari meteran.' };
-  if (objectResult?.status === 'COLLECTING' && !objectResult.sampleCount) return { ready:false, label:'Menunggu sampel pertama setelah pengujian dimulai.' };
-  return { ready:true, label:'Snapshot siap dicatat.' };
-}
-
-function objectFrameAgeText() {
-  if (!serialSession) return 'Perangkat terputus';
-  if (!lastFrameAt) return latestFrame?.status === 'invalid' ? 'Frame tidak valid diterima' : 'Menunggu data sensor';
-  const age = Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000));
-  const relative = age === 0 ? 'baru saja' : age < 60 ? `${age} detik lalu` : `${Math.round(age / 60)} menit lalu`;
-  return latestFrame?.status === 'invalid' ? `Frame tidak valid ${relative}` : `Frame terakhir ${relative}`;
-}
-
-function objectDurationText() {
-  if (!objectTestStartedAt) return '-';
-  const seconds = Math.max(0, (Date.now() - objectTestStartedAt) / 1000);
-  return `${seconds.toFixed(1)} dtk`;
-}
-
-function updateObjectVisual(result) {
-  const viz = $('#object-viz');
-  if (!viz) return;
-  const started = Boolean(objectTestStartedAt);
-  const vizState = !serialSession || result?.status === 'DEVICE_OFFLINE'
-    ? 'offline'
-    : result?.status === 'INVALID'
-      ? 'invalid'
-      : result?.detectionStatus === 'TOO_CLOSE'
-        ? 'too-close'
-        : result?.detectionStatus === 'TOO_FAR'
-          ? 'too-far'
-          : !started
-            ? 'idle'
-            : result?.status === 'STABLE'
-              ? 'stable'
-              : result?.status === 'UNSTABLE'
-                ? 'unstable'
-                : 'collecting';
-  const distance = Number.isFinite(Number(result?.distanceCm)) ? Number(result.distanceCm) : null;
-  const liveD = result?.distanceCm ?? null;
-  const svgContent = renderObjectSvg({
-    direction: objectDirection,
-    liveDistanceCm: liveD,
-    targetDistanceCm: Number(objectTargetCm) || null,
-    minCm: objectSettings.minCm,
-    maxCm: objectSettings.maxCm,
-    positionMode: objectPositionMode,
-    state: vizState,
-  });
-  viz.innerHTML = svgContent;
-  viz.dataset.state = vizState;
-  viz.dataset.direction = objectDirection;
-  const vizStateEl = $('#object-viz-state');
-  if (vizStateEl) vizStateEl.textContent = vizState.toUpperCase().replace('-', '_');
-  const dirMeta = objectDirectionMeta(objectDirection);
-  setText('object-direction-status', `${dirMeta.label} (${dirMeta.axisCode})`);
-  $$('.direction-card').forEach(card => {
-    const isActive = card.dataset.direction === objectDirection;
-    card.classList.toggle('is-active', isActive);
-    card.setAttribute('aria-pressed', String(isActive));
-  });
-}
-
-function updateObjectUI() {
-  if (measurementMode !== 'object' || route !== 'pengukuran') return;
-  const now = Date.now();
-  const started = Boolean(objectTestStartedAt);
-  const evaluation = evaluateObjectDetection({
-    connected: Boolean(serialSession),
-    frame: latestFrame,
-    lastFrameAt,
-    now,
-    distances: started ? objectDistances : [],
-    lastSequence: started ? objectLastSequence : latestFrame?.sequence ?? null,
-    range: objectSettings,
-  });
-  if (started) {
-    objectDistances = evaluation.distances;
-    objectLastSequence = evaluation.lastSequence;
-    objectResult = evaluation;
-  } else {
-    objectResult = { ...evaluation, status:'NO_OBJECT', sampleCount:0, distances:[], stabilityRangeCm:null, measuredDistanceCm:evaluation.distanceCm };
-  }
-  const status = objectStatusView(objectResult, started);
-  const measured = Number.isFinite(Number(objectResult?.measuredDistanceCm)) ? Number(objectResult.measuredDistanceCm) : null;
-  const actual = Number(objectActualCm);
-  const error = Number.isFinite(actual) && actual >= 1 ? objectError(measured, actual) : null;
-  setText('object-distance', objectResult?.distanceCm == null ? '-' : fmt(objectResult.distanceCm));
-  setText('object-last', objectFrameAgeText());
-  setText('object-status-note', status.note);
-  setText('object-range', objectResult?.stabilityRangeCm == null ? '-' : `${fmt(objectResult.stabilityRangeCm)} cm`);
-  setText('object-samples', `${started ? objectResult?.sampleCount ?? 0 : 0}/${OBJECT_DEFAULTS.sampleCount}`);
-  setText('object-target-range', `${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm`);
-  setText('object-target-summary', Number.isFinite(Number(objectTargetCm)) && Number(objectTargetCm) > 0 ? `${fmt(objectTargetCm)} cm` : '- cm');
-  setText('object-actual-summary', Number.isFinite(actual) && actual > 0 ? `${fmt(actual)} cm` : '- cm');
-  setText('object-error', error == null ? '- cm' : `${fmtSigned(error)} cm`);
-  setText('object-duration', objectDurationText());
-  setText('object-tech-sequence', latestFrame?.sequence == null ? '-' : String(latestFrame.sequence));
-  setText('object-tech-frame', latestFrame ? `${latestFrame.status}${latestFrame.error ? ` · ${latestFrame.error}` : ''}` : '-');
-  setText('object-tech-buffer', started && objectDistances.length ? objectDistances.map(value => fmt(value)).join(' · ') : '-');
-  setText('object-tech-range', `${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm`);
-  setText('object-tech-tolerance', `${fmt(objectSettings.toleranceCm)} cm`);
-  setText('object-tech-age', objectFrameAgeText());
-  const stability = $('#object-stability-status');
-  if (stability) {
-    stability.textContent = status.stability;
-    stability.className = `object-status-value ${status.tone}`;
-  }
-  const detection = $('#object-detection-status');
-  if (detection) {
-    detection.textContent = status.detection;
-    detection.className = `status ${status.detectionTone}`;
-  }
-  $$('#object-sample-pips .object-sample-pip').forEach((pip, index) => {
-    pip.classList.toggle('filled', index < (started ? objectResult?.sampleCount ?? 0 : 0));
-  });
-  const record = $('#object-record');
-  const capture = objectCaptureState();
-  if (record) record.disabled = !capture.ready;
-  setText('object-capture-state', capture.label);
-  const start = $('#object-start');
-  if (start) start.disabled = !serialSession || started;
-  const repeat = $('#object-repeat');
-  if (repeat) repeat.disabled = !serialSession || !started;
-  const reset = $('#object-reset');
-  if (reset) reset.disabled = !started && !objectTargetCm && !objectActualCm;
-  $$('.preset-btn').forEach(button => {
-    button.classList.toggle('is-active', String(Number(objectTargetCm)) === button.dataset.cm);
-  });
-  updateObjectVisual(objectResult);
-}
-
 function measurementPage() {
-  const objectMode = measurementMode === 'object';
-  return header('Pengukuran live', objectMode ? 'Deteksi objek universal dengan HC-SR04: enam arah pengujian manual, objek geometris universal. Snapshot disimpan sebagai dataset kalibrasi.' : 'Instrument membaca HC-SR04 secara langsung. Petugas memilih pengunjung dan menyimpan satu pembacaan yang valid.')
-    + measurementModeBar()
-    + (objectMode ? objectMeasurementView() : heightMeasurementView());
+  return header('Pengukuran live', 'Instrumen membaca HC-SR04 dari atas kepala secara langsung. Petugas memilih pengunjung dan menyimpan satu pembacaan yang valid.')
+    + heightMeasurementView();
 }
 
 function heightMeasurementView() {
@@ -839,7 +435,6 @@ function updateConnectionUI() {
     const className = `capture-validity ${readiness.tone}`;
     if (validity.className !== className) validity.className = className;
   }
-  updateObjectUI();
 }
 
 function processSerialLine(line) {
@@ -865,9 +460,6 @@ async function connectDevice() {
     latestFrame = null;
     lastFrameAt = 0;
     lastSavedSequence = null;
-    objectDistances = [];
-    objectLastSequence = null;
-    objectResult = null;
     updateConnectionUI();
     toast('ESP32 terhubung. Menunggu baris data JSON dari firmware…');
 
@@ -945,108 +537,6 @@ function visitorForm() {
       $('#form-error').innerHTML = `<p class="error-banner">${escape(error.message)}</p>`;
     }
   });
-}
-
-function renderObjectDataset() {
-  const region = $('#object-dataset-region');
-  if (region) region.innerHTML = objectDataset();
-  setText('object-dataset-count', String(objectTests.results.length));
-}
-
-function startObjectTest(repeat = false) {
-  if (!serialSession) {
-    toast('Hubungkan ESP32 sebelum memulai pengujian objek.', true);
-    return;
-  }
-  objectTestStartedAt = Date.now();
-  objectDistances = [];
-  objectLastSequence = latestFrame?.sequence ?? null;
-  objectRecorded = false;
-  objectResult = null;
-  if (!repeat) {
-    objectActualCm = '';
-    for (const id of ['object-actual', 'object-actual-mobile']) {
-      const actual = document.getElementById(id);
-      if (actual) actual.value = '';
-    }
-  }
-  updateObjectUI();
-  toast(repeat ? 'Pengujian objek diulang. Buffer sampel dimulai dari awal.' : 'Pengujian objek dimulai. Arahkan objek ke sensor.');
-}
-
-function resetObjectTest() {
-  objectTestStartedAt = 0;
-  objectDistances = [];
-  objectLastSequence = null;
-  objectRecorded = false;
-  objectResult = null;
-  objectTargetCm = '';
-  objectActualCm = '';
-  const target = $('#object-target');
-  if (target) target.value = '';
-  for (const id of ['object-actual', 'object-actual-mobile']) {
-    const actual = document.getElementById(id);
-    if (actual) actual.value = '';
-  }
-  updateObjectUI();
-  toast('Pengujian objek direset.');
-}
-
-function recordObjectTest() {
-  const capture = objectCaptureState();
-  if (!capture.ready) throw new Error(capture.label);
-  if (!objectResult) throw new Error('Belum ada hasil pengujian untuk dicatat.');
-  const latestValid = latestFrame?.status === 'ok' ? latestFrame : null;
-  const record = createObjectTestResult({
-    targetDistanceCm: Number(objectTargetCm),
-    actualDistanceCm: Number(objectActualCm),
-    measuredDistanceCm: objectResult.measuredDistanceCm,
-    detectionStatus: objectResult.detectionStatus,
-    stabilityStatus: objectResult.status,
-    stabilityRangeCm: objectResult.stabilityRangeCm,
-    sampleCount: objectResult.sampleCount,
-    durationMs: Date.now() - objectTestStartedAt,
-    targetMinCm: objectSettings.minCm,
-    targetMaxCm: objectSettings.maxCm,
-    toleranceCm: objectSettings.toleranceCm,
-    sequence: latestValid?.sequence ?? null,
-    calibrated: latestValid ? Boolean(latestValid.calibrated) : null,
-    direction: objectDirection,
-  });
-  objectTests = appendObjectTest(record);
-  objectRecorded = true;
-  renderObjectDataset();
-  updateObjectUI();
-  toast(record.errorCm == null ? 'Snapshot pengujian objek dicatat.' : `Snapshot dicatat; error ${fmtSigned(record.errorCm)} cm.`);
-}
-
-function exportObjectTestsCsv() {
-  if (!objectTests.results.length) {
-    toast('Belum ada hasil pengujian objek untuk diekspor.', true);
-    return;
-  }
-  download('cocomang-dataset-deteksi-objek.csv', objectTestsCsv(objectTests.results), 'text/csv;charset=utf-8');
-}
-
-function applyObjectRangeSettings() {
-  const minCm = Number($('#object-min')?.value);
-  const maxCm = Number($('#object-max')?.value);
-  const issue = validateObjectRange({ minCm, maxCm });
-  if (issue) {
-    const minInput = $('#object-min');
-    const maxInput = $('#object-max');
-    if (minInput) minInput.value = String(objectSettings.minCm);
-    if (maxInput) maxInput.value = String(objectSettings.maxCm);
-    toast(`${issue} Pengaturan sebelumnya tetap dipakai.`, true);
-    return;
-  }
-  if (minCm === objectSettings.minCm && maxCm === objectSettings.maxCm) return;
-  objectSettings = { ...objectSettings, minCm, maxCm };
-  objectDistances = [];
-  objectLastSequence = latestFrame?.sequence ?? null;
-  objectRecorded = false;
-  if (objectTestStartedAt) objectTestStartedAt = Date.now();
-  updateObjectUI();
 }
 
 function saveLiveReading() {
@@ -1139,19 +629,6 @@ function bindPage() {
   $('#history-status')?.addEventListener('change', event => { historyStatus = event.target.value; renderHistoryTable(); });
   $('#history-calibration')?.addEventListener('change', event => { historyCalibration = event.target.value; renderHistoryTable(); });
   $('#history-sort')?.addEventListener('change', event => { historySort = event.target.value; renderHistoryTable(); });
-  $('#object-target')?.addEventListener('input', event => { objectTargetCm = event.target.value; updateObjectUI(); });
-  for (const id of ['object-actual', 'object-actual-mobile']) {
-    document.getElementById(id)?.addEventListener('input', event => {
-      objectActualCm = event.target.value;
-      for (const otherId of ['object-actual', 'object-actual-mobile']) {
-        const other = document.getElementById(otherId);
-        if (other && other.value !== objectActualCm) other.value = objectActualCm;
-      }
-      updateObjectUI();
-    });
-  }
-  $('#object-min')?.addEventListener('change', applyObjectRangeSettings);
-  $('#object-max')?.addEventListener('change', applyObjectRangeSettings);
 }
 
 document.addEventListener('click', event => {
@@ -1167,42 +644,6 @@ document.addEventListener('click', event => {
   else if (action === 'export-csv') exportMeasurementsCsv();
   else if (action === 'print-pdf') printPdfReport();
   else if (action === 'clear-filter') { historyFrom = ''; historyTo = ''; historySearch = ''; historyStatus = 'all'; historyCalibration = 'all'; historySort = 'newest'; render(); }
-  else if (action === 'measurement-mode' && (button.dataset.mode === 'height' || button.dataset.mode === 'object')) {
-    if (measurementMode !== button.dataset.mode) {
-      objectDistances = [];
-      objectLastSequence = latestFrame?.sequence ?? null;
-      objectResult = null;
-      if (objectTestStartedAt) objectTestStartedAt = Date.now();
-      measurementMode = button.dataset.mode;
-      render();
-    }
-  }
-  else if (action === 'object-preset') {
-    objectTargetCm = button.dataset.cm || '';
-    const target = $('#object-target');
-    if (target) target.value = objectTargetCm;
-    updateObjectUI();
-  }
-  else if (action === 'object-direction') {
-    const newDir = normalizeObjectDirection(button.dataset.direction);
-    if (newDir !== objectDirection) {
-      objectDirection = newDir;
-      objectDistances = [];
-      objectLastSequence = latestFrame?.sequence ?? null;
-      objectResult = null;
-      objectRecorded = false;
-      if (objectTestStartedAt) objectTestStartedAt = Date.now();
-      render();
-      toast(`Arah pengujian: ${objectDirectionMeta(objectDirection).label} (${objectDirectionMeta(objectDirection).axisCode}). Sesuaikan orientasi fisik sensor secara manual.`);
-    }
-  }
-  else if (action === 'object-start') startObjectTest(false);
-  else if (action === 'object-repeat') startObjectTest(true);
-  else if (action === 'object-reset') resetObjectTest();
-  else if (action === 'object-record') {
-    try { recordObjectTest(); } catch (error) { toast(error.message, true); }
-  }
-  else if (action === 'export-object-csv') exportObjectTestsCsv();
   else if (action === 'help') showHelp();
   else if (action === 'close-modal') modal.close();
 });
@@ -1215,12 +656,6 @@ document.querySelector('.skip-link').addEventListener('click', event => {
 window.addEventListener('hashchange', () => {
   const next = location.hash.slice(1);
   route = navs.some(item => item[0] === next) ? next : 'ringkasan';
-  if (measurementMode === 'object') {
-    objectDistances = [];
-    objectLastSequence = latestFrame?.sequence ?? null;
-    objectResult = null;
-    if (objectTestStartedAt) objectTestStartedAt = Date.now();
-  }
   if (state) render();
 });
 
@@ -1228,16 +663,6 @@ window.addEventListener('storage', event => {
   if (event.key === 'cocomang-live-v1' && state) {
     try { state = repository.load(); render(); toast('Data pengukuran diperbarui dari tab lain.'); }
     catch (error) { toast(error.message, true); }
-  }
-  if (event.key === OBJECT_TESTS_STORAGE_KEY) {
-    try {
-      objectTests = loadObjectTests();
-      if (route === 'pengukuran' && measurementMode === 'object') {
-        renderObjectDataset();
-        updateObjectUI();
-      }
-      toast('Dataset pengujian objek diperbarui dari tab lain.');
-    } catch (error) { toast(error.message, true); }
   }
 });
 
@@ -1248,15 +673,8 @@ setInterval(() => {
 function boot() {
   try {
     state = repository.load();
-    let objectLoadError = '';
-    try { objectTests = loadObjectTests(); }
-    catch (error) {
-      objectTests = createEmptyObjectTests();
-      objectLoadError = error.message;
-    }
     route = navs.some(item => item[0] === route) ? route : 'ringkasan';
     render();
-    if (objectLoadError) toast(objectLoadError, true);
   } catch (error) {
     $('#app').innerHTML = `<main class="boot"><div><h1>Data belum dapat dibuka</h1><p>${escape(error.message)}</p></div></main>`;
   }
