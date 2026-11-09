@@ -1,5 +1,19 @@
 import { repository, addMember, addVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
 import { parseDeviceLine, parseRfidLine } from './serial-protocol.mjs';
+import { DEFAULT_RIDES, validateRideEligibility, createValidationRecord } from './ride-validator.mjs';
+import {
+  getSupabaseConfig,
+  saveSupabaseConfig,
+  isConfigured as isSupabaseConfigured,
+  testConnection as testSupabaseConnection,
+  fetchMembers as fetchSupabaseMembers,
+  upsertMember as upsertSupabaseMember,
+  updateMemberHeight as updateSupabaseMemberHeight,
+  fetchRides as fetchSupabaseRides,
+  recordValidation as recordSupabaseValidation,
+  syncLocalMembersToSupabase,
+  subscribeToRealtime,
+} from './supabase-service.mjs';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -12,6 +26,8 @@ const icon = name => ({
   close:'<path d="m6 6 12 12M6 18 18 6"/>',
   info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v1"/>',
   check:'<path d="m5 12 4 4L19 6"/>',
+  database:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+  alert:'<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
 }[name] || '<circle cx="12" cy="12" r="9"/>');
 const svg = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icon(name)}</svg>`;
 const fmt = value => Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—';
@@ -46,6 +62,13 @@ let historySearch = '';
 let historyStatus = 'all';
 let historyCalibration = 'all';
 let historySort = 'newest';
+
+// Supabase & Wahana State
+let supabaseStatus = isSupabaseConfigured() ? 'offline' : 'unconfigured';
+let activeRides = DEFAULT_RIDES;
+let selectedRideId = 'roller-coaster';
+let lastValidation = null;
+
 const modal = $('#modal');
 
 function toast(message, error = false) {
@@ -107,6 +130,15 @@ function statusPill() {
   if (!serialSession) return '<span class="pill offline"><i></i>ESP32 terputus</span>';
   if (!isLive()) return '<span class="pill waiting"><i></i>Menunggu data</span>';
   return '<span class="pill online"><i></i>Data live diterima</span>';
+}
+
+function cloudPill() {
+  const labels = {
+    connected: 'Cloud Terhubung',
+    offline: 'Mode Lokal',
+    unconfigured: 'Setel Supabase',
+  };
+  return `<button class="cloud-pill ${supabaseStatus}" data-action="open-db-settings" title="Pengaturan Database Supabase"><i></i>${labels[supabaseStatus] || 'Supabase'}</button>`;
 }
 
 function connectionInfo() {
@@ -256,16 +288,45 @@ function memberTable() {
 function membersPage() {
   const measured = state.visitors.filter(member => member.heightCm != null && member.measuredAt).length;
   const unmeasured = state.visitors.length - measured;
-  return header('Buku registrasi member', 'Identitas kartu RFID dan data member dicatat saat registrasi. Tinggi badan hanya berasal dari pembacaan sensor, bukan input operator.', `<button class="btn primary" data-action="add-member">${svg('plus')} Tambah member</button>`)
-    + `<section class="panel"><div class="panel-header"><div><h2>Member terdaftar <span class="count">${state.visitors.length}</span></h2><p>${measured} sudah diukur · ${unmeasured} belum diukur · data tersimpan lokal di peramban ini.</p></div></div>${memberTable()}</section>`;
+  return header('Buku registrasi member', 'Identitas kartu RFID dan data member dicatat saat registrasi. Tinggi badan diukur via sensor HC-SR04.', `<button class="btn primary" data-action="add-member">${svg('plus')} Tambah member</button>`)
+    + `<section class="panel"><div class="panel-header"><div><h2>Member terdaftar <span class="count">${state.visitors.length}</span></h2><p>${measured} sudah diukur · ${unmeasured} belum diukur · ${supabaseStatus === 'connected' ? 'tersinkronisasi ke Supabase Cloud' : 'tersimpan lokal di peramban ini'}.</p></div></div>${memberTable()}</section>`;
 }
 
 function memberOptions() {
-  return state.visitors.map(member => `<option value="${escape(member.id)}" ${member.id === selectedVisitorId ? 'selected' : ''}>${escape(member.name)}${member.rfidUid ? ` [${escape(member.rfidUid)}]` : ''}${member.age ? ` · ${member.age} th` : ''}</option>`).join('');
+  return state.visitors.map(member => `<option value="${escape(member.id)}" ${member.id === selectedVisitorId ? 'selected' : ''}>${escape(member.name)}${member.rfidUid ? ` [${escape(member.rfidUid)}]` : ''}${member.age ? ` · ${member.age} th` : ''}${member.heightCm != null ? ` (${fmt(member.heightCm)} cm)` : ''}</option>`).join('');
+}
+
+function rideOptions() {
+  return activeRides.map(ride => {
+    const maxInfo = ride.maxHeightCm ? `, Max: ${ride.maxHeightCm} cm` : '';
+    return `<option value="${escape(ride.id)}" ${ride.id === selectedRideId ? 'selected' : ''}>${escape(ride.name)} (Min: ${ride.minHeightCm} cm${maxInfo})</option>`;
+  }).join('');
+}
+
+function validationBannerView() {
+  if (!lastValidation) {
+    return `<div class="validation-banner">
+      <span class="validation-badge"><span class="status waiting">Siaga Validasi</span></span>
+      <p class="validation-detail">Pilih wahana dan tap kartu member pada <strong>Reader 2 (Akses Wahana)</strong> atau klik Uji Validasi.</p>
+    </div>`;
+  }
+  const { member, ride, evaluation, timestamp } = lastValidation;
+  const isOk = evaluation.eligible;
+  return `<div class="validation-banner ${isOk ? 'eligible' : 'rejected'}">
+    <div class="validation-badge ${isOk ? 'eligible' : 'rejected'}">
+      ${svg(isOk ? 'check' : 'alert')} ${isOk ? 'LOLOS AKSES WAHANA' : 'AKSES DITOLAK'}
+    </div>
+    <div class="validation-detail">
+      <strong>${escape(member.name)}</strong> (${escape(member.rfidUid || 'UID: —')}) · Tinggi: <strong>${fmt(evaluation.height)} cm</strong>
+      <br>Wahana: <strong>${escape(ride.name)}</strong> (Batas min: ${ride.minHeightCm} cm)
+      <br><small>${escape(evaluation.reason)}</small>
+    </div>
+    <span class="validation-meta">${when(timestamp)} WIB · Sinyal buzzer: ${isOk ? 'Bip normal' : 'Peringatan 3x'}</span>
+  </div>`;
 }
 
 function measurementPage() {
-  return header('Pengukuran live', 'Instrumen membaca HC-SR04 dari atas kepala secara langsung. Petugas memilih member dan menyimpan satu pembacaan yang valid.')
+  return header('Pengukuran live & validasi wahana', 'Instrumen membaca HC-SR04 dari atas kepala. Reader 1 untuk pendaftaran, Reader 2 untuk validasi batas tinggi wahana.')
     + heightMeasurementView();
 }
 
@@ -273,31 +334,41 @@ function heightMeasurementView() {
   const readiness = captureState();
   return `<div class="measurement-layout">
       <section class="panel instrument-panel device-panel">
-        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04</h2><p>Web Serial · 115200 baud · JSON per baris</p></div>${statusPill()}</div>
+        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>Web Serial · 115200 baud · Dual MFRC522</p></div>${statusPill()}</div>
         <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${serialSession ? 'disabled' : ''}>${svg('cable')} Hubungkan ESP32</button><button class="btn" id="disconnect-device" data-action="disconnect" ${serialSession ? '' : 'disabled'}>Putuskan</button></div>
         <p class="device-note" id="serial-help">Tutup Serial Monitor Arduino IDE sebelum menghubungkan perangkat. Gunakan Chrome atau Edge desktop melalui localhost atau HTTPS.</p>
         ${liveReadout('measure')}
       </section>
       <section class="panel capture-panel">
-        <div class="panel-header"><div><p class="eyebrow">Pencatatan hasil</p><h2>Simpan pengukuran</h2><p>Pilih member, lalu simpan pembacaan live yang sedang tampil.</p></div></div>
+        <div class="panel-header"><div><p class="eyebrow">Pencatatan & Validasi</p><h2>Pengukuran & Akses Wahana</h2><p>Pilih member, simpan tinggi live, dan validasi syarat wahana.</p></div></div>
         <div class="capture-body">
-          <div class="field"><label for="measurement-visitor">Member <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih member</option>${memberOptions()}</select><p class="field-help">${state.visitors.length ? 'Pilih member atau dekatkan kartu ke reader RFID.' : 'Belum ada member terdaftar.'} <button type="button" class="text-button inline" data-action="add-member">+ Tambah member baru</button></p></div>
+          <div class="field"><label for="measurement-visitor">Member Terpilih <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih member</option>${memberOptions()}</select><p class="field-help">${state.visitors.length ? 'Pilih member atau dekatkan kartu ke Reader 1 / Reader 2.' : 'Belum ada member terdaftar.'} <button type="button" class="text-button inline" data-action="add-member">+ Tambah member baru</button></p></div>
           <div class="capture-readout" aria-label="Data hasil pembacaan">
             <div class="capture-row"><span>Hasil tinggi dari ESP32</span><strong id="capture-height">— cm</strong></div>
             <div class="capture-row"><span>Jarak sensor</span><strong id="capture-distance">— cm</strong></div>
             <div class="capture-row"><span>Status validitas</span><strong class="capture-validity ${readiness.tone}" id="capture-validity">${readiness.label}</strong></div>
           </div>
-          <button class="btn primary full" data-action="save-reading" id="save-reading" ${readiness.ready ? '' : 'disabled'}>${svg('check')} Simpan hasil live</button>
+          <button class="btn primary full" data-action="save-reading" id="save-reading" ${readiness.ready ? '' : 'disabled'}>${svg('check')} Simpan hasil ukur ke profil member</button>
+
+          <div class="ride-validation-section">
+            <div class="field">
+              <label for="ride-selector">Wahana Permainan Tujuan</label>
+              <select id="ride-selector">${rideOptions()}</select>
+              <p class="field-help">Tap kartu di <strong>Reader 2</strong> untuk verifikasi instan atau klik tombol di bawah.</p>
+            </div>
+            <button class="btn full" data-action="manual-validate" id="btn-manual-validate">${svg('database')} Uji Validasi Akses Wahana</button>
+            <div id="validation-banner-region">${validationBannerView()}</div>
+          </div>
         </div>
       </section>
     </div>
     <section class="panel guide-panel">
-      <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Pemasangan dan pembacaan</h2></div><span class="guide-formula">tinggi = Href − (jarak + offset)</span></div>
+      <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Dual RFID & Logika Wahana</h2></div><span class="guide-formula">tinggi = Href − (jarak + offset)</span></div>
       <dl class="guide-grid">
-        <div class="guide-item"><dt>Orientasi sensor</dt><dd>HC-SR04 menghadap lurus ke bawah di atas area member.</dd></div>
-        <div class="guide-item"><dt>Rumus tinggi</dt><dd><code>tinggi = tinggi referensi − (jarak + offset)</code></dd></div>
-        <div class="guide-item"><dt>Tinggi referensi</dt><dd>Ukur dari lantai ke permukaan depan transduser setelah perangkat terpasang.</dd></div>
-        <div class="guide-item"><dt>Offset kalibrasi</dt><dd>Diisi dari pengujian fisik dengan alat ukur pembanding. Offset 0 bukan berarti terkalibrasi.</dd></div>
+        <div class="guide-item"><dt>Reader 1 (VSPI)</dt><dd>Pos Pendaftaran: Kartu baru yang di-tap langsung membuka form registrasi member.</dd></div>
+        <div class="guide-item"><dt>Reader 2 (HSPI)</dt><dd>Pos Akses Wahana: Kartu yang di-tap langsung divalidasi dengan batas tinggi wahana terpilih.</dd></div>
+        <div class="guide-item"><dt>Sinyal Buzzer ESP32</dt><dd>ESP32 membunyikan 1x bip normal jika lolos, atau 3x bip peringatan jika tinggi kurang.</dd></div>
+        <div class="guide-item"><dt>Database Supabase</dt><dd>Data member dan log kelayakan wahana tersimpan di PostgreSQL cloud secara real-time.</dd></div>
       </dl>
     </section>`;
 }
@@ -358,9 +429,9 @@ function historyPage() {
   const exportActions = `<button class="btn" data-action="export-csv">${svg('download')} Ekspor CSV</button><button class="btn primary" data-action="print-pdf">${svg('printer')} Cetak / Simpan PDF</button>`;
   return header('Riwayat pengukuran', 'Ledger hasil aktual yang disimpan dari ESP32. Pencarian, filter, ekspor, dan cetak mengikuti data tersimpan.', exportActions)
     + `<section class="panel">
-        <div class="panel-header"><div><h2>Data pengukuran <span class="count" id="history-count">${rows.length}</span></h2><p>Rekaman hanya bertambah saat operator menekan Simpan hasil live.</p></div><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>
+        <div class="panel-header"><div><h2>Data pengukuran <span class="count" id="history-count">${rows.length}</span></h2><p>Rekaman bertambah saat operator menekan Simpan hasil ukur.</p></div><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>
         ${historyToolbar()}
-        <div class="history-meta"><span id="history-result-meta">${historyMeta(rows)}</span><span>Waktu WIB · data lokal</span></div>
+        <div class="history-meta"><span id="history-result-meta">${historyMeta(rows)}</span><span>Waktu WIB · ${supabaseStatus === 'connected' ? 'Cloud & Lokal' : 'data lokal'}</span></div>
         <div id="history-table-region">${measurementLedger(rows)}</div>
       </section>`;
 }
@@ -382,14 +453,14 @@ function render() {
     <header class="masthead">
       <div class="masthead-inner">
         <a class="brand" href="#ringkasan"><span class="brand-name">COCOMANG</span><span class="brand-caption">Smart Height Measurement System</span></a>
-        <div class="desk-identity"><span>Meja Pengujian</span><strong>Sensor Tinggi Badan</strong></div>
-        <div class="operator"><span class="mode-label">ESP32 · USB Serial · 115200</span>${statusPill()}<button class="icon-button" data-action="help" aria-label="Panduan koneksi perangkat">${svg('info')}</button></div>
+        <div class="desk-identity"><span>Pos Ukur & Wahana</span><strong>ESP32 Dual RFID</strong></div>
+        <div class="operator"><span class="mode-label">Serial 115200</span>${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan koneksi perangkat">${svg('info')}</button></div>
       </div>
       <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}</nav>
     </header>
     <div class="workspace"><div class="topbar"><span class="breadcrumb">Pos pengukuran <span>/</span> <strong>${current}</strong></span><span class="date-label">${new Date().toLocaleDateString('id-ID', { weekday:'long', day:'numeric', month:'long', year:'numeric', timeZone:'Asia/Jakarta' })}</span></div>
       <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : (route === 'member' || route === 'pengunjung') ? membersPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
-        <footer class="workspace-footer"><div><strong>COCOMANG</strong><span>Smart Height Measurement System · data tersimpan lokal pada peramban ini.</span></div><button class="link-plain" data-action="help">Petunjuk perangkat dan batas integrasi</button></footer>
+        <footer class="workspace-footer"><div><strong>COCOMANG</strong><span>Smart Height Measurement System · ${supabaseStatus === 'connected' ? 'Terhubung ke Supabase Cloud' : 'Mode Penyimpanan Lokal'}.</span></div><button class="link-plain" data-action="help">Petunjuk perangkat & batas integrasi</button></footer>
       </main></div></div>`;
   bindPage();
   updateConnectionUI();
@@ -449,6 +520,60 @@ function updateConnectionUI() {
   }
 }
 
+async function sendSerialCommand(cmd) {
+  if (!serialSession?.port?.writable) return;
+  try {
+    const writer = serialSession.port.writable.getWriter();
+    const encoder = new TextEncoder();
+    await writer.write(encoder.encode(cmd + '\n'));
+    writer.releaseLock();
+  } catch (err) {
+    console.warn('Gagal mengirim perintah serial ke ESP32:', err);
+  }
+}
+
+async function handleRideValidation(member, readerId = 2) {
+  const ride = activeRides.find(r => r.id === selectedRideId) || activeRides[0];
+  if (!ride) return;
+
+  const currentHeight = frameNow()?.heightCm ?? member.heightCm;
+  const evaluation = validateRideEligibility(member, ride, currentHeight);
+
+  lastValidation = {
+    member,
+    ride,
+    evaluation,
+    timestamp: new Date().toISOString(),
+  };
+
+  const bannerRegion = $('#validation-banner-region');
+  if (bannerRegion) {
+    bannerRegion.innerHTML = validationBannerView();
+  }
+
+  if (evaluation.eligible) {
+    await sendSerialCommand('b'); // Bip 1x normal
+    toast(`[VALIDASI] ${member.name} LOLOS masuk wahana ${ride.name}!`);
+  } else {
+    await sendSerialCommand('n'); // Bip 3x peringatan
+    toast(`[VALIDASI] ${member.name} DITOLAK: ${evaluation.reason}`, true);
+  }
+
+  // Rekam ke Supabase
+  try {
+    const record = createValidationRecord({
+      member,
+      ride,
+      evaluation,
+      readerId,
+      now: lastValidation.timestamp,
+    });
+    await recordSupabaseValidation(record);
+  } catch (err) {
+    console.warn('Gagal mencatat log validasi ke Supabase:', err);
+  }
+}
+
 function processSerialLine(line) {
   const rfidEvent = parseRfidLine(line);
   if (rfidEvent) {
@@ -462,14 +587,32 @@ function processSerialLine(line) {
     }
 
     const matchedMember = state.visitors.find(m => m.rfidUid && normalizeRfid(m.rfidUid) === normalizeRfid(rfidEvent.uid));
+
+    // Jika di-tap di Reader 2 (Akses Masuk Wahana)
+    if (rfidEvent.reader === 2) {
+      if (matchedMember) {
+        selectedVisitorId = matchedMember.id;
+        const select = document.getElementById('measurement-visitor');
+        if (select) select.value = matchedMember.id;
+        updateConnectionUI();
+        void handleRideValidation(matchedMember, 2);
+      } else {
+        void sendSerialCommand('n');
+        toast(`Kartu RFID ${rfidEvent.uid} di Reader Akses belum terdaftar sebagai member.`, true);
+      }
+      return;
+    }
+
+    // Jika di-tap di Reader 1 (Pendaftaran Member)
     if (matchedMember) {
       selectedVisitorId = matchedMember.id;
       const select = document.getElementById('measurement-visitor');
       if (select) select.value = matchedMember.id;
       updateConnectionUI();
-      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via tap kartu RFID.`);
+      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via Reader Pendaftaran.`);
     } else {
-      toast(`Kartu RFID ${rfidEvent.uid} terdeteksi dari reader ${rfidEvent.reader}. Belum terdaftar.`);
+      toast(`Kartu RFID ${rfidEvent.uid} baru terdeteksi. Membuka formulir pendaftaran member…`);
+      memberForm(rfidEvent.uid);
     }
     return;
   }
@@ -545,14 +688,14 @@ function openModal(title, subtitle, content) {
   if (!modal.open) modal.showModal();
 }
 
-function memberForm() {
-  const initialRfid = lastScannedRfid || '';
+function memberForm(prefillRfid = '') {
+  const initialRfid = prefillRfid || lastScannedRfid || '';
   openModal('Tambah member baru', 'Registrasi kartu fisik RFID dan identitas member. Tinggi badan diukur otomatis dari sensor.', `<form id="member-form" class="form-grid" novalidate>
     <div id="form-error" role="alert"></div>
     <div class="field">
       <label for="member-rfid">UID Kartu RFID <span class="req">*</span></label>
       <input id="member-rfid" name="rfidUid" required autocomplete="off" spellcheck="false" placeholder="Contoh: 04:A1:B2:C3 atau 04A1B2C3" value="${escape(initialRfid)}">
-      <p class="field-help">${serialSession ? 'Dekatkan kartu ke Reader RC522 (Pendaftaran) atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
+      <p class="field-help">${serialSession ? 'Dekatkan kartu ke Reader 1 (Pendaftaran) atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
     </div>
     <div class="field"><label for="member-name">Nama lengkap <span class="req">*</span></label><input id="member-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama member"></div>
     <div class="field-row">
@@ -564,7 +707,7 @@ function memberForm() {
     <p class="form-note">Kartu RFID berfungsi sebagai tiket akses member. Tinggi badan akan diukur melalui sensor ultrasonik pada pos ukur.</p>
     <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan member</button></div>
   </form>`);
-  $('#member-form').addEventListener('submit', event => {
+  $('#member-form').addEventListener('submit', async event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
@@ -574,14 +717,101 @@ function memberForm() {
       modal.close();
       render();
       if (route !== 'pengukuran') location.hash = 'pengukuran';
-      toast(`Member ${member.name} (${member.rfidUid}) berhasil didaftarkan.`);
+      toast(`Member ${member.name} (${member.rfidUid}) tersimpan.`);
+
+      // Sinkronkan ke Supabase jika aktif
+      if (supabaseStatus === 'connected') {
+        const synced = await upsertSupabaseMember(member);
+        if (synced) toast(`Member ${member.name} tersimpan ke Supabase Cloud.`);
+      }
     } catch (error) {
       $('#form-error').innerHTML = `<p class="error-banner">${escape(error.message)}</p>`;
     }
   });
 }
 
-function saveLiveReading() {
+async function openSupabaseModal() {
+  const cfg = getSupabaseConfig();
+  const statusLabels = {
+    connected: '<span class="status good">🟢 Terhubung ke Supabase Cloud</span>',
+    offline: '<span class="status waiting">🟡 Mode Lokal (Kredensial tersimpan)</span>',
+    unconfigured: '<span class="status">⚪ Belum Dikonfigurasi</span>',
+  };
+
+  openModal('Pengaturan Database Supabase', 'Konfigurasi PostgreSQL Cloud untuk sinkronisasi multi-device & data wahana.', `<div class="form-grid">
+    <div class="db-settings-status" id="db-status-box">Status saat ini: ${statusLabels[supabaseStatus] || statusLabels.unconfigured}</div>
+    <div id="db-form-error" role="alert"></div>
+    <div class="field">
+      <label for="sb-url">Supabase Project URL <span class="req">*</span></label>
+      <input id="sb-url" type="url" placeholder="https://xyzcompany.supabase.co" value="${escape(cfg.url)}">
+      <p class="field-help">Dapat dilihat di Dashboard Supabase → Project Settings → API.</p>
+    </div>
+    <div class="field">
+      <label for="sb-key">Supabase Anon Public Key <span class="req">*</span></label>
+      <input id="sb-key" type="password" placeholder="eyJhbGciOiJIUzI1NiIsIn..." value="${escape(cfg.anonKey)}">
+      <p class="field-help">Kunci publik anonim (aman digunakan di browser client).</p>
+    </div>
+    <div class="modal-actions" style="margin-top:10px;">
+      <button type="button" class="btn" id="btn-test-db">Tes Koneksi</button>
+      <button type="button" class="btn" id="btn-sync-local">Sinkronkan Data Lokal ke Cloud</button>
+      <button type="button" class="btn primary" id="btn-save-db">Simpan Pengaturan</button>
+    </div>
+    <div class="db-quick-guide">
+      <strong>Catatan Setup:</strong> Pastikan tabel <code>members</code>, <code>rides</code>, dan <code>ride_validations</code> sudah dibuat menggunakan file <code>cocomang/supabase/schema.sql</code> di Supabase SQL Editor.
+    </div>
+  </div>`);
+
+  $('#btn-test-db')?.addEventListener('click', async () => {
+    const url = $('#sb-url').value.trim();
+    const key = $('#sb-key').value.trim();
+    if (!url || !key) {
+      $('#db-form-error').innerHTML = '<p class="error-banner">Masukkan Project URL dan Anon Key terlebih dahulu.</p>';
+      return;
+    }
+    $('#db-status-box').innerHTML = 'Menguji koneksi ke Supabase…';
+    const result = await testSupabaseConnection(url, key);
+    if (result.success) {
+      $('#db-form-error').innerHTML = '';
+      $('#db-status-box').innerHTML = '<span class="status good">🟢 Sukses: Terhubung ke database Supabase!</span>';
+    } else {
+      $('#db-form-error').innerHTML = `<p class="error-banner">${escape(result.message)}</p>`;
+      $('#db-status-box').innerHTML = '<span class="status alarm">🔴 Gagal menghubungi Supabase</span>';
+    }
+  });
+
+  $('#btn-save-db')?.addEventListener('click', async () => {
+    const url = $('#sb-url').value.trim();
+    const key = $('#sb-key').value.trim();
+    saveSupabaseConfig({ url, anonKey: key });
+    if (url && key) {
+      const test = await testSupabaseConnection(url, key);
+      supabaseStatus = test.success ? 'connected' : 'offline';
+      if (test.success) {
+        await initCloudData();
+      }
+    } else {
+      supabaseStatus = 'unconfigured';
+    }
+    modal.close();
+    render();
+    toast(supabaseStatus === 'connected' ? 'Pengaturan Supabase disimpan & terhubung!' : 'Pengaturan disimpan (Mode Lokal).');
+  });
+
+  $('#btn-sync-local')?.addEventListener('click', async () => {
+    if (supabaseStatus !== 'connected') {
+      toast('Hubungkan Supabase terlebih dahulu sebelum sinkronisasi.', true);
+      return;
+    }
+    const res = await syncLocalMembersToSupabase(state.visitors);
+    if (res.synced > 0) {
+      toast(`${res.synced} data member berhasil diunggah ke Supabase!`);
+    } else {
+      toast('Tidak ada data baru untuk disinkronkan.');
+    }
+  });
+}
+
+async function saveLiveReading() {
   if (!serialSession) throw new Error('ESP32 belum terhubung.');
   if (!latestFrame || latestFrame.status !== 'ok') throw new Error('Belum ada pembacaan live yang valid dari ESP32.');
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) throw new Error('Data sensor sudah kedaluwarsa. Tunggu pembacaan live berikutnya.');
@@ -591,6 +821,13 @@ function saveLiveReading() {
   commit(next => { entry = recordMeasurement(next, selectedVisitorId, latestFrame); });
   lastSavedSequence = latestFrame.sequence;
   toast(`Hasil ${fmt(entry.heightCm)} cm tersimpan untuk ${entry.visitorName}.`);
+
+  // Update tinggi member di Supabase
+  const member = state.visitors.find(m => m.id === selectedVisitorId);
+  if (member?.rfidUid && supabaseStatus === 'connected') {
+    void updateSupabaseMemberHeight(member.rfidUid, entry.heightCm, entry.capturedAt);
+  }
+
   render();
 }
 
@@ -654,22 +891,23 @@ function printPdfReport() {
 }
 
 function showHelp() {
-  openModal('Petunjuk perangkat', 'Koneksi, kalibrasi, dan batas integrasi COCOMANG SmartHeight.', `<ul class="help-list">
-    <li>Gunakan Chrome atau Edge versi desktop.</li>
-    <li>Buka aplikasi melalui <strong>http://localhost:8000</strong> atau HTTPS. Jangan membuka file HTML langsung.</li>
-    <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32.</li>
-    <li>Pilih COM port ESP32 pada dialog browser. Baud rate firmware 115200.</li>
-    <li>Dual RFID didukung: Reader 1 untuk pendaftaran member, Reader 2 untuk validasi akses wahana.</li>
-    <li>HC-SR04 dipasang menghadap ke bawah. Firmware menghitung <code>tinggi = Href − (jarak + offset)</code>.</li>
-    <li>Buzzer pada GPIO 27 dikendalikan firmware saat tinggi di bawah 100 cm. Website hanya menampilkan statusnya.</li>
-    <li>Data hanya disimpan saat petugas menekan Simpan hasil live. Data tersimpan di peramban ini, bukan cloud.</li>
-    </ul><div class="notice">Pembacaan adalah estimasi prototipe. Verifikasi reference height, offset, dan posisi sensor secara fisik sebelum menyimpulkan akurasi.</div><div class="modal-actions"><button class="btn primary" data-action="close-modal">Mengerti</button></div>`);
+  openModal('Petunjuk perangkat & Supabase', 'Koneksi, Dual RFID, dan integrasi cloud COCOMANG.', `<ul class="help-list">
+    <li>Gunakan Chrome atau Edge versi desktop melalui <strong>http://localhost:8000</strong> atau HTTPS.</li>
+    <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32. Baud rate 115200.</li>
+    <li><strong>Dual RFID:</strong> Reader 1 untuk pendaftaran member baru, Reader 2 untuk validasi akses wahana.</li>
+    <li><strong>Buzzer Pasif:</strong> Menghasilkan 1x bip saat lolos syarat wahana, dan 3x bip saat tinggi badan kurang.</li>
+    <li><strong>Supabase PostgreSQL:</strong> Klik tombol status Supabase di header untuk mengisi URL & Anon Key.</li>
+    <li>Data tetap aman tersimpan lokal di browser meskipun tidak ada koneksi internet.</li>
+    </ul><div class="modal-actions"><button class="btn primary" data-action="close-modal">Mengerti</button></div>`);
 }
 
 function bindPage() {
   $('#measurement-visitor')?.addEventListener('change', event => {
     selectedVisitorId = event.target.value;
     updateConnectionUI();
+  });
+  $('#ride-selector')?.addEventListener('change', event => {
+    selectedRideId = event.target.value;
   });
   $('#history-from')?.addEventListener('change', event => { historyFrom = event.target.value; renderHistoryTable(); });
   $('#history-to')?.addEventListener('change', event => { historyTo = event.target.value; renderHistoryTable(); });
@@ -687,8 +925,17 @@ document.addEventListener('click', event => {
   else if (action === 'connect') void connectDevice();
   else if (action === 'disconnect') void disconnectDevice();
   else if (action === 'save-reading') {
-    try { saveLiveReading(); } catch (error) { toast(error.message, true); }
+    try { void saveLiveReading(); } catch (error) { toast(error.message, true); }
   }
+  else if (action === 'manual-validate') {
+    const member = state.visitors.find(m => m.id === selectedVisitorId);
+    if (!member) {
+      toast('Pilih member terlebih dahulu untuk divalidasi.', true);
+      return;
+    }
+    void handleRideValidation(member, 2);
+  }
+  else if (action === 'open-db-settings') void openSupabaseModal();
   else if (action === 'export-csv') exportMeasurementsCsv();
   else if (action === 'print-pdf') printPdfReport();
   else if (action === 'clear-filter') { historyFrom = ''; historyTo = ''; historySearch = ''; historyStatus = 'all'; historyCalibration = 'all'; historySort = 'newest'; render(); }
@@ -696,7 +943,7 @@ document.addEventListener('click', event => {
   else if (action === 'close-modal') modal.close();
 });
 
-document.querySelector('.skip-link').addEventListener('click', event => {
+document.querySelector('.skip-link')?.addEventListener('click', event => {
   event.preventDefault();
   $('#main')?.focus();
 });
@@ -717,10 +964,68 @@ setInterval(() => {
   if (serialSession) updateConnectionUI();
 }, 1000);
 
-function boot() {
+async function initCloudData() {
+  if (!isSupabaseConfigured()) return;
+  try {
+    const rides = await fetchSupabaseRides();
+    if (rides?.length) activeRides = rides;
+
+    const remoteMembers = await fetchSupabaseMembers();
+    if (remoteMembers?.length) {
+      // Sinkronkan remote member ke local repository jika belum ada
+      commit(next => {
+        for (const rm of remoteMembers) {
+          if (!next.visitors.some(local => local.rfidUid && normalizeRfid(local.rfidUid) === normalizeRfid(rm.rfidUid))) {
+            next.visitors.push(rm);
+          }
+        }
+      });
+    }
+
+    void subscribeToRealtime({
+      onMemberChange: () => {
+        toast('Data member diperbarui dari Supabase Realtime.');
+        void fetchSupabaseMembers().then(updated => {
+          if (updated?.length) {
+            commit(next => {
+              for (const rm of updated) {
+                const idx = next.visitors.findIndex(local => local.rfidUid && normalizeRfid(local.rfidUid) === normalizeRfid(rm.rfidUid));
+                if (idx >= 0) next.visitors[idx] = rm;
+                else next.visitors.push(rm);
+              }
+            });
+            render();
+          }
+        });
+      },
+      onValidationChange: payload => {
+        if (payload?.new) {
+          const val = payload.new;
+          toast(`[Realtime Wahana] ${val.member_name}: ${val.is_eligible ? 'Lolos' : 'Ditolak'} (${val.ride_name})`);
+        }
+      },
+    });
+  } catch (err) {
+    console.warn('initCloudData error:', err);
+  }
+}
+
+async function boot() {
   try {
     state = repository.load();
     route = normalizeRoute(location.hash);
+
+    if (isSupabaseConfigured()) {
+      const cfg = getSupabaseConfig();
+      const test = await testSupabaseConnection(cfg.url, cfg.anonKey);
+      supabaseStatus = test.success ? 'connected' : 'offline';
+      if (test.success) {
+        await initCloudData();
+      }
+    } else {
+      supabaseStatus = 'unconfigured';
+    }
+
     render();
   } catch (error) {
     $('#app').innerHTML = `<main class="boot"><div><h1>Data belum dapat dibuka</h1><p>${escape(error.message)}</p></div></main>`;

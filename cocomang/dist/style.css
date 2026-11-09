@@ -1613,3 +1613,148 @@ dialog::backdrop { background: rgba(23, 54, 42, 0.5); }
     scroll-behavior: auto !important;
   }
 }
+
+/* ==========================================================================
+   Supabase Cloud & Ride Validation Components
+   ========================================================================== */
+
+.cloud-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.2);
+  color: #fff;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.cloud-pill:hover {
+  background: rgba(255, 255, 255, 0.15);
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.cloud-pill i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.cloud-pill.connected i {
+  background: #4ade80;
+  box-shadow: 0 0 6px #4ade80;
+}
+
+.cloud-pill.offline i {
+  background: #facc15;
+  box-shadow: 0 0 5px #facc15;
+}
+
+.cloud-pill.unconfigured i {
+  background: #94a3b8;
+}
+
+/* Ride Validation Panel & Banner */
+.ride-validation-section {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+}
+
+.validation-banner {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: var(--surface-muted);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.validation-banner.eligible {
+  background: #eef6ec;
+  border-color: #9ecc92;
+  color: #1b4d1b;
+}
+
+.validation-banner.rejected {
+  background: #fdf0ed;
+  border-color: #e5998a;
+  color: #7a1f14;
+}
+
+.validation-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.validation-badge.eligible {
+  color: #1f6b21;
+}
+
+.validation-badge.rejected {
+  color: #991b1b;
+}
+
+.validation-detail {
+  font-size: 12px;
+  line-height: 1.45;
+  color: inherit;
+}
+
+.validation-meta {
+  font-size: 10.5px;
+  opacity: 0.85;
+}
+
+/* Database Settings Modal */
+.db-settings-status {
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface-muted);
+}
+
+.db-settings-status.ok {
+  background: #eef6ec;
+  border-color: #9ecc92;
+  color: #1b4d1b;
+}
+
+.db-settings-status.warn {
+  background: #fef8e7;
+  border-color: #eed07b;
+  color: #6a4a0c;
+}
+
+.db-quick-guide {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--surface-muted);
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  margin-top: 12px;
+}
+
+.db-quick-guide code {
+  font-family: var(--font-mono);
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
