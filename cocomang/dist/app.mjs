@@ -1,5 +1,5 @@
-import { repository, addVisitor, recordMeasurement, csvExport } from './data.mjs';
-import { parseDeviceLine } from './serial-protocol.mjs';
+import { repository, addMember, addVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
+import { parseDeviceLine, parseRfidLine } from './serial-protocol.mjs';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -18,15 +18,27 @@ const fmt = value => Number.isFinite(Number(value)) ? Number(value).toFixed(1) :
 const fmtSigned = value => `${Number(value) >= 0 ? '+' : ''}${fmt(value)}`;
 const when = value => value ? new Date(value).toLocaleString('id-ID', { dateStyle:'medium', timeStyle:'short', timeZone:'Asia/Jakarta' }) : '—';
 const todayKey = date => new Date(date).toLocaleDateString('en-CA', { timeZone:'Asia/Jakarta' });
-const navs = [['ringkasan','Ringkasan'],['pengunjung','Pengunjung'],['pengukuran','Pengukuran Live'],['riwayat','Riwayat Ukur']];
+const navs = [
+  ['ringkasan', 'Ringkasan'],
+  ['member', 'Member'],
+  ['pengukuran', 'Pengukuran Live'],
+  ['riwayat', 'Riwayat Ukur'],
+];
+
+function normalizeRoute(hash) {
+  const raw = (hash || '').replace(/^#/, '');
+  if (raw === 'pengunjung') return 'member';
+  return navs.some(item => item[0] === raw) ? raw : 'ringkasan';
+}
 
 let state;
-let route = location.hash.slice(1) || 'ringkasan';
+let route = normalizeRoute(location.hash);
 let selectedVisitorId = '';
 let serialSession = null;
 let latestFrame = null;
 let lastFrameAt = 0;
 let lastSavedSequence = null;
+let lastScannedRfid = '';
 let toastTimer;
 let historyFrom = '';
 let historyTo = '';
@@ -140,7 +152,7 @@ function captureState() {
   if (latestFrame?.status === 'invalid') return { ready:false, label:'Pembacaan tidak valid', tone:'alarm' };
   if (!frame) return { ready:false, label:'Menunggu data valid', tone:'waiting' };
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) return { ready:false, label:'Data sensor kedaluwarsa', tone:'waiting' };
-  if (!selectedVisitorId) return { ready:false, label:'Pilih pengunjung', tone:'waiting' };
+  if (!selectedVisitorId) return { ready:false, label:'Pilih member', tone:'waiting' };
   if (frame.sequence != null && frame.sequence === lastSavedSequence) return { ready:false, label:'Pembacaan ini sudah disimpan', tone:'good' };
   return { ready:true, label:'Siap disimpan', tone:'good' };
 }
@@ -190,8 +202,8 @@ function liveReadout(prefix = 'live') {
 }
 
 function dashboardPage() {
-  const measuredVisitors = state.visitors.filter(visitor => visitor.heightCm != null && visitor.measuredAt).length;
-  const unmeasuredVisitors = state.visitors.length - measuredVisitors;
+  const measuredMembers = state.visitors.filter(member => member.heightCm != null && member.measuredAt).length;
+  const unmeasuredMembers = state.visitors.length - measuredMembers;
   const measuredToday = state.measurements.filter(item => todayKey(item.capturedAt) === todayKey(new Date())).length;
   const latest = state.measurements[0];
   const previous = state.measurements.slice(1, 5);
@@ -200,16 +212,16 @@ function dashboardPage() {
     ? `<div class="latest-primary">
         <span class="latest-label">Hasil tersimpan terbaru</span>
         <div class="latest-value">${fmt(latest.heightCm)}<small>cm</small></div>
-        <span class="latest-name">${escape(latest.visitorName)}</span>
+        <span class="latest-name">${escape(latest.visitorName)}${latest.memberRfid ? ` <code class="rfid-badge">${escape(latest.memberRfid)}</code>` : ''}</span>
         <span class="latest-time">${when(latest.capturedAt)} WIB · jarak ${fmt(latest.distanceCm)} cm</span>
       </div>
       ${previous.length ? `<ul class="latest-list" aria-label="Pengukuran sebelumnya">${previous.map(row => `<li class="latest-row"><div><span class="latest-row-name">${escape(row.visitorName)}</span><span class="latest-row-time">${when(row.capturedAt)}</span></div><span class="latest-row-value">${fmt(row.heightCm)} cm</span></li>`).join('')}</ul>` : ''}`
-    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan ESP32, pilih pengunjung, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
-  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi pengunjung, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('cable')} Buka pengukuran live</a>`)
+    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan ESP32, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
+  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('cable')} Buka pengukuran live</a>`)
     + `<section class="summary-strip" aria-label="Ringkasan operasional">
-        ${summaryCell('Pengunjung', state.visitors.length, 'orang', `${measuredVisitors} sudah diukur`)}
-        ${summaryCell('Sudah diukur', measuredVisitors, 'orang', 'Memiliki hasil sensor')}
-        ${summaryCell('Belum diukur', unmeasuredVisitors, 'orang', 'Menunggu pos ukur')}
+        ${summaryCell('Member', state.visitors.length, 'orang', `${measuredMembers} sudah diukur`)}
+        ${summaryCell('Sudah diukur', measuredMembers, 'orang', 'Memiliki hasil sensor')}
+        ${summaryCell('Belum diukur', unmeasuredMembers, 'orang', 'Menunggu pos ukur')}
         ${summaryCell('Hasil tersimpan', state.measurements.length, 'data', `${measuredToday} hari ini · WIB`)}
         <div class="summary-cell" id="device-connection-metric"><span class="summary-label">Koneksi perangkat</span><span class="summary-value summary-status ${connection.tone}" id="device-connection-value">${connection.label}</span><span class="summary-note">ESP32 · USB Serial 115200</span></div>
       </section>
@@ -221,7 +233,7 @@ function dashboardPage() {
         <section class="panel latest-panel">
           <div class="panel-header"><div><p class="eyebrow">Ledger pengukuran</p><h2>Pengukuran terakhir</h2></div><a class="text-button" href="#riwayat">Riwayat lengkap</a></div>
           ${latestPanel}
-          <div class="panel-actions"><a class="btn" href="#pengunjung">Kelola pengunjung</a></div>
+          <div class="panel-actions"><a class="btn" href="#member">Kelola member</a></div>
         </section>
       </div>`;
 }
@@ -233,27 +245,27 @@ function genderText(value) {
   return '—';
 }
 
-function visitorTable() {
-  if (!state.visitors.length) return '<div class="empty"><strong>Belum ada pengunjung terdaftar.</strong>Catat identitas manual sebelum menyimpan hasil pengukuran.<br><button class="text-button" data-action="add-visitor">Tambah pengunjung pertama</button></div>';
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="registry-table"><caption class="sr-only">Buku registrasi pengunjung</caption><thead><tr><th>No.</th><th>Nama</th><th>Usia</th><th>Jenis kelamin</th><th class="numeric">Berat badan</th><th class="numeric">Tinggi badan</th><th>Status pengukuran</th><th>Waktu pengukuran</th></tr></thead><tbody>${state.visitors.map((visitor, index) => {
-    const measured = visitor.heightCm != null && Boolean(visitor.measuredAt);
-    return `<tr><td class="numeric row-index">${index + 1}</td><td><strong class="visitor-name">${escape(visitor.name)}</strong>${visitor.notes ? `<span class="row-note visitor-notes">${escape(visitor.notes)}</span>` : ''}</td><td class="numeric">${visitor.age ?? '—'}</td><td>${genderText(visitor.gender)}</td><td class="numeric">${visitor.weightKg == null ? '—' : `${fmt(visitor.weightKg)} kg`}</td><td class="numeric"><strong>${visitor.heightCm == null ? '—' : `${fmt(visitor.heightCm)} cm`}</strong>${measured ? '<span class="row-note">Dari sensor</span>' : ''}</td><td><span class="status ${measured ? 'good' : 'waiting'}">${measured ? 'Sudah diukur' : 'Belum diukur'}</span></td><td>${visitor.measuredAt ? when(visitor.measuredAt) : '—'}</td></tr>`;
+function memberTable() {
+  if (!state.visitors.length) return '<div class="empty"><strong>Belum ada member terdaftar.</strong>Catat identitas kartu RFID dan data member sebelum menyimpan hasil pengukuran.<br><button class="text-button" data-action="add-member">Tambah member pertama</button></div>';
+  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="registry-table"><caption class="sr-only">Buku registrasi member</caption><thead><tr><th>No.</th><th>UID Kartu RFID</th><th>Nama</th><th>Usia</th><th>Jenis kelamin</th><th class="numeric">Berat badan</th><th class="numeric">Tinggi badan</th><th>Status pengukuran</th><th>Waktu pengukuran</th></tr></thead><tbody>${state.visitors.map((member, index) => {
+    const measured = member.heightCm != null && Boolean(member.measuredAt);
+    return `<tr><td class="numeric row-index">${index + 1}</td><td><code class="rfid-badge">${escape(member.rfidUid || '—')}</code></td><td><strong class="visitor-name member-name">${escape(member.name)}</strong>${member.notes ? `<span class="row-note visitor-notes">${escape(member.notes)}</span>` : ''}</td><td class="numeric">${member.age ?? '—'}</td><td>${genderText(member.gender)}</td><td class="numeric">${member.weightKg == null ? '—' : `${fmt(member.weightKg)} kg`}</td><td class="numeric"><strong>${member.heightCm == null ? '—' : `${fmt(member.heightCm)} cm`}</strong>${measured ? '<span class="row-note">Dari sensor</span>' : ''}</td><td><span class="status ${measured ? 'good' : 'waiting'}">${measured ? 'Sudah diukur' : 'Belum diukur'}</span></td><td>${member.measuredAt ? when(member.measuredAt) : '—'}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
-function visitorsPage() {
-  const measured = state.visitors.filter(visitor => visitor.heightCm != null && visitor.measuredAt).length;
+function membersPage() {
+  const measured = state.visitors.filter(member => member.heightCm != null && member.measuredAt).length;
   const unmeasured = state.visitors.length - measured;
-  return header('Buku registrasi pengunjung', 'Identitas dicatat manual. Tinggi badan hanya berasal dari pembacaan sensor, bukan input operator.', `<button class="btn primary" data-action="add-visitor">${svg('plus')} Tambah pengunjung</button>`)
-    + `<section class="panel"><div class="panel-header"><div><h2>Pengunjung terdaftar <span class="count">${state.visitors.length}</span></h2><p>${measured} sudah diukur · ${unmeasured} belum diukur · data tersimpan lokal di peramban ini.</p></div></div>${visitorTable()}</section>`;
+  return header('Buku registrasi member', 'Identitas kartu RFID dan data member dicatat saat registrasi. Tinggi badan hanya berasal dari pembacaan sensor, bukan input operator.', `<button class="btn primary" data-action="add-member">${svg('plus')} Tambah member</button>`)
+    + `<section class="panel"><div class="panel-header"><div><h2>Member terdaftar <span class="count">${state.visitors.length}</span></h2><p>${measured} sudah diukur · ${unmeasured} belum diukur · data tersimpan lokal di peramban ini.</p></div></div>${memberTable()}</section>`;
 }
 
-function visitorOptions() {
-  return state.visitors.map(visitor => `<option value="${escape(visitor.id)}" ${visitor.id === selectedVisitorId ? 'selected' : ''}>${escape(visitor.name)}${visitor.age ? ` · ${visitor.age} th` : ''}</option>`).join('');
+function memberOptions() {
+  return state.visitors.map(member => `<option value="${escape(member.id)}" ${member.id === selectedVisitorId ? 'selected' : ''}>${escape(member.name)}${member.rfidUid ? ` [${escape(member.rfidUid)}]` : ''}${member.age ? ` · ${member.age} th` : ''}</option>`).join('');
 }
 
 function measurementPage() {
-  return header('Pengukuran live', 'Instrumen membaca HC-SR04 dari atas kepala secara langsung. Petugas memilih pengunjung dan menyimpan satu pembacaan yang valid.')
+  return header('Pengukuran live', 'Instrumen membaca HC-SR04 dari atas kepala secara langsung. Petugas memilih member dan menyimpan satu pembacaan yang valid.')
     + heightMeasurementView();
 }
 
@@ -267,9 +279,9 @@ function heightMeasurementView() {
         ${liveReadout('measure')}
       </section>
       <section class="panel capture-panel">
-        <div class="panel-header"><div><p class="eyebrow">Pencatatan hasil</p><h2>Simpan pengukuran</h2><p>Pilih pengunjung, lalu simpan pembacaan live yang sedang tampil.</p></div></div>
+        <div class="panel-header"><div><p class="eyebrow">Pencatatan hasil</p><h2>Simpan pengukuran</h2><p>Pilih member, lalu simpan pembacaan live yang sedang tampil.</p></div></div>
         <div class="capture-body">
-          <div class="field"><label for="measurement-visitor">Pengunjung <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih pengunjung</option>${visitorOptions()}</select><p class="field-help">${state.visitors.length ? 'Identitas manual di menu Pengunjung.' : 'Belum ada pengunjung terdaftar.'} <button type="button" class="text-button inline" data-action="add-visitor">+ Tambah baru</button></p></div>
+          <div class="field"><label for="measurement-visitor">Member <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih member</option>${memberOptions()}</select><p class="field-help">${state.visitors.length ? 'Pilih member atau dekatkan kartu ke reader RFID.' : 'Belum ada member terdaftar.'} <button type="button" class="text-button inline" data-action="add-member">+ Tambah member baru</button></p></div>
           <div class="capture-readout" aria-label="Data hasil pembacaan">
             <div class="capture-row"><span>Hasil tinggi dari ESP32</span><strong id="capture-height">— cm</strong></div>
             <div class="capture-row"><span>Jarak sensor</span><strong id="capture-distance">— cm</strong></div>
@@ -282,7 +294,7 @@ function heightMeasurementView() {
     <section class="panel guide-panel">
       <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Pemasangan dan pembacaan</h2></div><span class="guide-formula">tinggi = Href − (jarak + offset)</span></div>
       <dl class="guide-grid">
-        <div class="guide-item"><dt>Orientasi sensor</dt><dd>HC-SR04 menghadap lurus ke bawah di atas area pengunjung.</dd></div>
+        <div class="guide-item"><dt>Orientasi sensor</dt><dd>HC-SR04 menghadap lurus ke bawah di atas area member.</dd></div>
         <div class="guide-item"><dt>Rumus tinggi</dt><dd><code>tinggi = tinggi referensi − (jarak + offset)</code></dd></div>
         <div class="guide-item"><dt>Tinggi referensi</dt><dd>Ukur dari lantai ke permukaan depan transduser setelah perangkat terpasang.</dd></div>
         <div class="guide-item"><dt>Offset kalibrasi</dt><dd>Diisi dari pengujian fisik dengan alat ukur pembanding. Offset 0 bukan berarti terkalibrasi.</dd></div>
@@ -307,7 +319,7 @@ function filteredMeasurements() {
     const day = todayKey(item.capturedAt);
     if (historyFrom && day < historyFrom) return false;
     if (historyTo && day > historyTo) return false;
-    if (term && !item.visitorName.toLowerCase().includes(term)) return false;
+    if (term && !item.visitorName.toLowerCase().includes(term) && !(item.memberRfid && item.memberRfid.toLowerCase().includes(term))) return false;
     if (historyStatus === 'normal' && item.buzzerAlarm) return false;
     if (historyStatus === 'alarm' && !item.buzzerAlarm) return false;
     if (historyCalibration === 'confirmed' && !item.calibrated) return false;
@@ -318,9 +330,9 @@ function filteredMeasurements() {
 }
 
 function measurementLedger(rows) {
-  if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Hubungkan ESP32 melalui pos pengukuran, pilih pengunjung, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
+  if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Hubungkan ESP32 melalui pos pengukuran, pilih member, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
   if (!rows.length) return '<div class="empty"><strong>Tidak ada data yang cocok.</strong>Ubah rentang tanggal atau filter, lalu coba lagi.<br><button class="text-button" data-action="clear-filter">Reset semua filter</button></div>';
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama pengunjung</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong">${escape(row.visitorName)}</span></td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples}/5 sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
+  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan member</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama member</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong member-name">${escape(row.visitorName)}</span>${row.memberRfid ? `<span class="row-note"><code class="rfid-badge">${escape(row.memberRfid)}</code></span>` : ''}</td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples}/5 sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function historyMeta(rows) {
@@ -331,7 +343,7 @@ function historyMeta(rows) {
 function historyToolbar() {
   const option = (value, label, current) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
   return `<div class="history-toolbar" aria-label="Filter riwayat pengukuran">
-    <label class="tool-field search"><span>Cari nama</span><input id="history-search" type="search" placeholder="Nama pengunjung" autocomplete="off" value="${escape(historySearch)}"></label>
+    <label class="tool-field search"><span>Cari nama / UID</span><input id="history-search" type="search" placeholder="Cari nama atau UID RFID" autocomplete="off" value="${escape(historySearch)}"></label>
     <label class="tool-field"><span>Dari</span><input id="history-from" type="date" value="${escape(historyFrom)}"></label>
     <label class="tool-field"><span>Sampai</span><input id="history-to" type="date" value="${escape(historyTo)}"></label>
     <label class="tool-field"><span>Status</span><select id="history-status">${option('all', 'Semua status', historyStatus)}${option('normal', 'Normal', historyStatus)}${option('alarm', 'Ambang buzzer', historyStatus)}</select></label>
@@ -376,7 +388,7 @@ function render() {
       <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}</nav>
     </header>
     <div class="workspace"><div class="topbar"><span class="breadcrumb">Pos pengukuran <span>/</span> <strong>${current}</strong></span><span class="date-label">${new Date().toLocaleDateString('id-ID', { weekday:'long', day:'numeric', month:'long', year:'numeric', timeZone:'Asia/Jakarta' })}</span></div>
-      <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : route === 'pengunjung' ? visitorsPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
+      <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : (route === 'member' || route === 'pengunjung') ? membersPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
         <footer class="workspace-footer"><div><strong>COCOMANG</strong><span>Smart Height Measurement System · data tersimpan lokal pada peramban ini.</span></div><button class="link-plain" data-action="help">Petunjuk perangkat dan batas integrasi</button></footer>
       </main></div></div>`;
   bindPage();
@@ -438,6 +450,30 @@ function updateConnectionUI() {
 }
 
 function processSerialLine(line) {
+  const rfidEvent = parseRfidLine(line);
+  if (rfidEvent) {
+    lastScannedRfid = rfidEvent.uid;
+    const rfidInput = document.getElementById('member-rfid');
+    if (rfidInput) {
+      rfidInput.value = rfidEvent.uid;
+      rfidInput.focus();
+      toast(`Kartu RFID terdeteksi dari reader ${rfidEvent.reader} (${rfidEvent.label}): ${rfidEvent.uid}`);
+      return;
+    }
+
+    const matchedMember = state.visitors.find(m => m.rfidUid && normalizeRfid(m.rfidUid) === normalizeRfid(rfidEvent.uid));
+    if (matchedMember) {
+      selectedVisitorId = matchedMember.id;
+      const select = document.getElementById('measurement-visitor');
+      if (select) select.value = matchedMember.id;
+      updateConnectionUI();
+      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via tap kartu RFID.`);
+    } else {
+      toast(`Kartu RFID ${rfidEvent.uid} terdeteksi dari reader ${rfidEvent.reader}. Belum terdaftar.`);
+    }
+    return;
+  }
+
   const frame = parseDeviceLine(line);
   if (!frame) return;
   latestFrame = frame;
@@ -461,7 +497,7 @@ async function connectDevice() {
     lastFrameAt = 0;
     lastSavedSequence = null;
     updateConnectionUI();
-    toast('ESP32 terhubung. Menunggu baris data JSON dari firmware…');
+    toast('ESP32 terhubung. Menunggu data live dari firmware…');
 
     const reader = port.readable.getReader();
     session.reader = reader;
@@ -509,30 +545,36 @@ function openModal(title, subtitle, content) {
   if (!modal.open) modal.showModal();
 }
 
-function visitorForm() {
-  openModal('Tambah pengunjung', 'Identitas manual untuk mengaitkan hasil ukur. Tinggi badan tidak diisi manual.', `<form id="visitor-form" class="form-grid" novalidate>
+function memberForm() {
+  const initialRfid = lastScannedRfid || '';
+  openModal('Tambah member baru', 'Registrasi kartu fisik RFID dan identitas member. Tinggi badan diukur otomatis dari sensor.', `<form id="member-form" class="form-grid" novalidate>
     <div id="form-error" role="alert"></div>
-    <div class="field"><label for="visitor-name">Nama lengkap <span class="req">*</span></label><input id="visitor-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama pengunjung"></div>
-    <div class="field-row">
-      <div class="field"><label for="visitor-age">Usia (tahun)</label><input id="visitor-age" name="age" type="number" min="1" max="120" step="1" placeholder="18"></div>
-      <div class="field"><label for="visitor-gender">Jenis kelamin</label><select id="visitor-gender" name="gender"><option value="">Belum diisi</option><option value="L">Laki-laki</option><option value="P">Perempuan</option><option value="Lainnya">Lainnya</option></select></div>
-      <div class="field"><label for="visitor-weight">Berat badan (kg)</label><input id="visitor-weight" name="weightKg" type="number" min="1" max="300" step="0.1" placeholder="60"></div>
+    <div class="field">
+      <label for="member-rfid">UID Kartu RFID <span class="req">*</span></label>
+      <input id="member-rfid" name="rfidUid" required autocomplete="off" spellcheck="false" placeholder="Contoh: 04:A1:B2:C3 atau 04A1B2C3" value="${escape(initialRfid)}">
+      <p class="field-help">${serialSession ? 'Dekatkan kartu ke Reader RC522 (Pendaftaran) atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
     </div>
-    <div class="field"><label for="visitor-notes">Catatan</label><textarea id="visitor-notes" name="notes" rows="3" maxlength="500" placeholder="Catatan pengukuran (opsional)"></textarea></div>
-    <p class="form-note">Tinggi badan akan diisi dari pembacaan sensor pada pos pengukuran. Tidak ada pembaca kartu identitas pada tahap ini.</p>
-    <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan pengunjung</button></div>
+    <div class="field"><label for="member-name">Nama lengkap <span class="req">*</span></label><input id="member-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama member"></div>
+    <div class="field-row">
+      <div class="field"><label for="member-age">Usia (tahun)</label><input id="member-age" name="age" type="number" min="1" max="120" step="1" placeholder="18"></div>
+      <div class="field"><label for="member-gender">Jenis kelamin</label><select id="member-gender" name="gender"><option value="">Belum diisi</option><option value="L">Laki-laki</option><option value="P">Perempuan</option><option value="Lainnya">Lainnya</option></select></div>
+      <div class="field"><label for="member-weight">Berat badan (kg)</label><input id="member-weight" name="weightKg" type="number" min="1" max="300" step="0.1" placeholder="60"></div>
+    </div>
+    <div class="field"><label for="member-notes">Catatan</label><textarea id="member-notes" name="notes" rows="3" maxlength="500" placeholder="Catatan member (opsional)"></textarea></div>
+    <p class="form-note">Kartu RFID berfungsi sebagai tiket akses member. Tinggi badan akan diukur melalui sensor ultrasonik pada pos ukur.</p>
+    <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan member</button></div>
   </form>`);
-  $('#visitor-form').addEventListener('submit', event => {
+  $('#member-form').addEventListener('submit', event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
-      let visitor;
-      commit(next => { visitor = addVisitor(next, data); });
-      selectedVisitorId = visitor.id;
+      let member;
+      commit(next => { member = addMember(next, data); });
+      selectedVisitorId = member.id;
       modal.close();
       render();
       if (route !== 'pengukuran') location.hash = 'pengukuran';
-      toast(`Pengunjung ${visitor.name} ditambahkan.`);
+      toast(`Member ${member.name} (${member.rfidUid}) berhasil didaftarkan.`);
     } catch (error) {
       $('#form-error').innerHTML = `<p class="error-banner">${escape(error.message)}</p>`;
     }
@@ -543,7 +585,7 @@ function saveLiveReading() {
   if (!serialSession) throw new Error('ESP32 belum terhubung.');
   if (!latestFrame || latestFrame.status !== 'ok') throw new Error('Belum ada pembacaan live yang valid dari ESP32.');
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) throw new Error('Data sensor sudah kedaluwarsa. Tunggu pembacaan live berikutnya.');
-  if (!selectedVisitorId) throw new Error('Pilih pengunjung terlebih dahulu.');
+  if (!selectedVisitorId) throw new Error('Pilih member terlebih dahulu.');
   if (latestFrame.sequence != null && latestFrame.sequence === lastSavedSequence) throw new Error('Pembacaan ini sudah disimpan. Tunggu data live berikutnya.');
   let entry;
   commit(next => { entry = recordMeasurement(next, selectedVisitorId, latestFrame); });
@@ -568,10 +610,15 @@ function exportMeasurementsCsv() {
     return;
   }
   const data = rows.map(row => ({
-    'Waktu WIB': when(row.capturedAt), 'Pengunjung': row.visitorName,
-    'Tinggi (cm)': row.heightCm, 'Jarak sensor (cm)': row.distanceCm,
-    'Tinggi referensi (cm)': row.referenceHeightCm, 'Offset (cm)': row.offsetCm,
-    'Sampel valid': `${row.validSamples}/5`, 'Status pengukuran': row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Normal',
+    'Waktu WIB': when(row.capturedAt),
+    'Member': row.visitorName,
+    'UID RFID': row.memberRfid || '—',
+    'Tinggi (cm)': row.heightCm,
+    'Jarak sensor (cm)': row.distanceCm,
+    'Tinggi referensi (cm)': row.referenceHeightCm,
+    'Offset (cm)': row.offsetCm,
+    'Sampel valid': `${row.validSamples}/5`,
+    'Status pengukuran': row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Normal',
     'Kalibrasi': row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi',
   }));
   download('cocomang-riwayat-pengukuran.csv', csvExport(data), 'text/csv;charset=utf-8');
@@ -599,10 +646,10 @@ function printPdfReport() {
     historyStatus !== 'all' ? `Status ${historyStatus === 'alarm' ? 'ambang buzzer aktif' : 'normal'}` : '',
     historyCalibration !== 'all' ? `Kalibrasi ${historyCalibration === 'confirmed' ? 'terkalibrasi' : 'belum terkalibrasi'}` : '',
   ].filter(Boolean).join(' · ');
-  const body = rows.map((row, index) => `<tr><td>${index + 1}</td><td>${escape(when(row.capturedAt))}</td><td>${escape(row.visitorName)}</td><td>${fmt(row.heightCm)}</td><td>${fmt(row.distanceCm)}</td><td>${row.buzzerAlarm ? 'Ambang &lt; 100 cm' : 'Normal'}</td><td>${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</td></tr>`).join('');
+  const body = rows.map((row, index) => `<tr><td>${index + 1}</td><td>${escape(when(row.capturedAt))}</td><td>${escape(row.visitorName)}</td><td><code class="rfid-badge">${escape(row.memberRfid || '—')}</code></td><td>${fmt(row.heightCm)}</td><td>${fmt(row.distanceCm)}</td><td>${row.buzzerAlarm ? 'Ambang &lt; 100 cm' : 'Normal'}</td><td>${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</td></tr>`).join('');
   printWindow.document.write(`<!doctype html><html lang="id"><head><meta charset="utf-8"><title>Laporan Pengukuran COCOMANG</title><style>
-    @page{size:A4;margin:16mm}*{box-sizing:border-box}body{font:11px Arial,sans-serif;color:#243c32;margin:0}h1{font-family:Georgia,serif;font-size:22px;font-weight:600;margin:2px 0 4px}p{color:#59675d;line-height:1.5;margin:0}.brandline{display:flex;align-items:baseline;gap:10px;border-top:3px solid #254b3e;padding-top:12px}.brandline strong{font-size:16px;letter-spacing:.08em}.brandline span{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#59675d}.meta{border-bottom:1px solid #b9c1ad;padding-bottom:12px;margin-bottom:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0}.summary div{border:1px solid #cbd3c5;padding:9px 10px}.summary span{display:block;color:#59675d;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.summary strong{display:block;font-size:17px;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #cbd3c5;padding:7px 6px;text-align:left;font-size:9px}th{background:#eef0e7;font-size:8px;text-transform:uppercase;letter-spacing:.05em}td:nth-child(1),td:nth-child(4),td:nth-child(5){font-variant-numeric:tabular-nums}.foot{margin-top:18px;font-size:9px;color:#657064;border-top:1px solid #cbd3c5;padding-top:8px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui Web Serial</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Pengunjung</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
+    @page{size:A4;margin:16mm}*{box-sizing:border-box}body{font:11px Arial,sans-serif;color:#243c32;margin:0}h1{font-family:Georgia,serif;font-size:22px;font-weight:600;margin:2px 0 4px}p{color:#59675d;line-height:1.5;margin:0}.brandline{display:flex;align-items:baseline;gap:10px;border-top:3px solid #254b3e;padding-top:12px}.brandline strong{font-size:16px;letter-spacing:.08em}.brandline span{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#59675d}.meta{border-bottom:1px solid #b9c1ad;padding-bottom:12px;margin-bottom:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0}.summary div{border:1px solid #cbd3c5;padding:9px 10px}.summary span{display:block;color:#59675d;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.summary strong{display:block;font-size:17px;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #cbd3c5;padding:7px 6px;text-align:left;font-size:9px}th{background:#eef0e7;font-size:8px;text-transform:uppercase;letter-spacing:.05em}td:nth-child(1),td:nth-child(5),td:nth-child(6){font-variant-numeric:tabular-nums}.rfid-badge{display:inline-block;padding:1px 5px;font-family:monospace;font-size:8.5px;background:#eef0e7;border:1px solid #cbd3c5;border-radius:3px}.foot{margin-top:18px;font-size:9px;color:#657064;border-top:1px solid #cbd3c5;padding-top:8px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan Member</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui Web Serial</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Member</th><th>UID RFID</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
   printWindow.document.close();
 }
 
@@ -612,6 +659,7 @@ function showHelp() {
     <li>Buka aplikasi melalui <strong>http://localhost:8000</strong> atau HTTPS. Jangan membuka file HTML langsung.</li>
     <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32.</li>
     <li>Pilih COM port ESP32 pada dialog browser. Baud rate firmware 115200.</li>
+    <li>Dual RFID didukung: Reader 1 untuk pendaftaran member, Reader 2 untuk validasi akses wahana.</li>
     <li>HC-SR04 dipasang menghadap ke bawah. Firmware menghitung <code>tinggi = Href − (jarak + offset)</code>.</li>
     <li>Buzzer pada GPIO 27 dikendalikan firmware saat tinggi di bawah 100 cm. Website hanya menampilkan statusnya.</li>
     <li>Data hanya disimpan saat petugas menekan Simpan hasil live. Data tersimpan di peramban ini, bukan cloud.</li>
@@ -635,7 +683,7 @@ document.addEventListener('click', event => {
   const button = event.target.closest('[data-action]');
   if (!button || button.disabled) return;
   const action = button.dataset.action;
-  if (action === 'add-visitor') visitorForm();
+  if (action === 'add-member' || action === 'add-visitor') memberForm();
   else if (action === 'connect') void connectDevice();
   else if (action === 'disconnect') void disconnectDevice();
   else if (action === 'save-reading') {
@@ -654,8 +702,7 @@ document.querySelector('.skip-link').addEventListener('click', event => {
 });
 
 window.addEventListener('hashchange', () => {
-  const next = location.hash.slice(1);
-  route = navs.some(item => item[0] === next) ? next : 'ringkasan';
+  route = normalizeRoute(location.hash);
   if (state) render();
 });
 
@@ -673,7 +720,7 @@ setInterval(() => {
 function boot() {
   try {
     state = repository.load();
-    route = navs.some(item => item[0] === route) ? route : 'ringkasan';
+    route = normalizeRoute(location.hash);
     render();
   } catch (error) {
     $('#app').innerHTML = `<main class="boot"><div><h1>Data belum dapat dibuka</h1><p>${escape(error.message)}</p></div></main>`;

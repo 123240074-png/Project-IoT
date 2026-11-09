@@ -1,6 +1,18 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { STORAGE_KEY, createInitialState, addVisitor, recordMeasurement, repository, validateDeviceFrame } from '../dist/data.mjs';
+import {
+  STORAGE_KEY,
+  createInitialState,
+  addVisitor,
+  addMember,
+  recordMeasurement,
+  repository,
+  validateDeviceFrame,
+  normalizeRfid,
+  formatRfid,
+  isValidRfid,
+  validateMember,
+} from '../dist/data.mjs';
 
 let storage;
 beforeEach(() => {
@@ -26,8 +38,8 @@ test('starts with empty real-data collections, not demo visitors', () => {
 
 test('adds a manual visitor without RFID', () => {
   const state = createInitialState();
-  const visitor = addVisitor(state, { name: 'Pengunjung Uji', age: '18', notes: '' }, '2026-11-09T00:00:00.000Z');
-  assert.equal(visitor.name, 'Pengunjung Uji');
+  const visitor = addVisitor(state, { name: 'Member Uji', age: '18', notes: '' }, '2026-11-09T00:00:00.000Z');
+  assert.equal(visitor.name, 'Member Uji');
   assert.equal(visitor.age, 18);
   assert.equal(visitor.heightCm, null);
   assert.equal('rfid' in visitor, false);
@@ -35,11 +47,11 @@ test('adds a manual visitor without RFID', () => {
 
 test('stores optional gender and weight without changing the schema version', () => {
   const state = createInitialState();
-  const visitor = addVisitor(state, { name: 'Pengunjung Uji', age: '27', gender: 'Perempuan', weightKg: '58.5' });
+  const visitor = addVisitor(state, { name: 'Member Uji', age: '27', gender: 'Perempuan', weightKg: '58.5' });
   assert.equal(visitor.gender, 'P');
   assert.equal(visitor.weightKg, 58.5);
   assert.equal(state.schemaVersion, 1);
-  assert.throws(() => addVisitor(state, { name: 'Pengunjung Uji', weightKg: '400' }), /Berat badan/);
+  assert.throws(() => addVisitor(state, { name: 'Member Uji', weightKg: '400' }), /Berat badan/);
 });
 
 test('loads legacy visitors that have no gender or weight fields', () => {
@@ -58,7 +70,7 @@ test('loads legacy visitors that have no gender or weight fields', () => {
 
 test('stores only validated live readings and updates selected visitor', () => {
   const state = createInitialState();
-  const visitor = addVisitor(state, { name: 'Pengunjung Uji', age: '' });
+  const visitor = addVisitor(state, { name: 'Member Uji', age: '' });
   const entry = recordMeasurement(state, visitor.id, goodFrame, '2026-11-09T00:01:00.000Z');
   assert.equal(entry.heightCm, 171.5);
   assert.equal(entry.distanceCm, 48.5);
@@ -69,10 +81,10 @@ test('stores only validated live readings and updates selected visitor', () => {
 
 test('rejects a bad frame, invalid visitor, or missing selected visitor', () => {
   const state = createInitialState();
-  const visitor = addVisitor(state, { name: 'Pengunjung Uji' });
+  const visitor = addVisitor(state, { name: 'Member Uji' });
   assert.equal(validateDeviceFrame({ ...goodFrame, heightCm: 999 }) !== null, true);
   assert.throws(() => recordMeasurement(state, visitor.id, { ...goodFrame, status: 'invalid' }), /Sensor|pembacaan/);
-  assert.throws(() => recordMeasurement(state, 'missing', goodFrame), /Pilih pengunjung/);
+  assert.throws(() => recordMeasurement(state, 'missing', goodFrame), /Pilih member/);
   assert.throws(() => addVisitor(state, { name: 'A' }), /Nama harus/);
 });
 
@@ -85,4 +97,49 @@ test('repository persists state under the live namespace', () => {
   assert.equal(loaded.measurements.length, 1);
   assert.equal(loaded.visitors[0].heightCm, 171.5);
   assert.ok(storage.has(STORAGE_KEY));
+});
+
+test('validates and formats 4-byte, 7-byte, and 10-byte RFID UIDs correctly', () => {
+  assert.equal(isValidRfid('04:A1:B2:C3'), true);
+  assert.equal(isValidRfid('04a1b2c3'), true);
+  assert.equal(isValidRfid('04-A1-B2-C3-D4-E5-F6'), true);
+  assert.equal(isValidRfid('04 A1 B2 C3 D4 E5 F6 A7 B8 C9'), true);
+  assert.equal(isValidRfid('XYZ12345'), false);
+  assert.equal(isValidRfid('04:A1'), false);
+  assert.equal(formatRfid('04a1b2c3'), '04:A1:B2:C3');
+  assert.equal(normalizeRfid('04:A1:B2:C3'), '04A1B2C3');
+});
+
+test('adds a member with valid RFID UID and links UID to measurement entry', () => {
+  const state = createInitialState();
+  const member = addMember(state, {
+    name: 'Budi Santoso',
+    rfidUid: '04:A1:B2:C3',
+    age: '24',
+    gender: 'L',
+  });
+  assert.equal(member.name, 'Budi Santoso');
+  assert.equal(member.rfidUid, '04:A1:B2:C3');
+  assert.equal(state.visitors.length, 1);
+
+  const entry = recordMeasurement(state, member.id, goodFrame);
+  assert.equal(entry.memberRfid, '04:A1:B2:C3');
+  assert.equal(entry.visitorName, 'Budi Santoso');
+});
+
+test('prevents registering duplicate RFID card UID across members', () => {
+  const state = createInitialState();
+  addMember(state, { name: 'Member Pertama', rfidUid: '04:A1:B2:C3' });
+  assert.throws(
+    () => addMember(state, { name: 'Member Kedua', rfidUid: '04a1b2c3' }),
+    /sudah digunakan/
+  );
+});
+
+test('validates RFID input requirement on form registration', () => {
+  const errEmpty = validateMember({ name: 'Member Uji', rfidUid: '' }, { requireRfid: true });
+  assert.equal(errEmpty.rfidUid, 'UID kartu RFID wajib diisi.');
+
+  const errInvalid = validateMember({ name: 'Member Uji', rfidUid: 'ZZ:99' }, { requireRfid: true });
+  assert.match(errInvalid.rfidUid, /Format UID kartu RFID tidak valid/);
 });
