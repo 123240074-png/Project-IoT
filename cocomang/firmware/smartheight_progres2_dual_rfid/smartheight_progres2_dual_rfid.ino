@@ -87,6 +87,7 @@ static uint32_t lastRfidMs       = 0;
 static uint32_t lastRfid1ReadMs  = 0;
 static uint32_t lastRfid2ReadMs  = 0;
 static const uint32_t RFID_COOLDOWN_MS = 1500; // Mencegah spam deteksi kartu yang sama
+static uint32_t sequenceNumber = 1;
 
 // ============================================================
 // DRIVER MFRC522 NATIVE DUAL-SPI (MENDUKUNG SPICLASS TERPISAH)
@@ -422,6 +423,23 @@ void printUidString(const MFRC522_DualSPI::Uid &uid) {
 }
 
 // ============================================================
+// EMISI TELEMETRI SERIAL JSON (KOMPATIBEL DENGAN WEB DASHBOARD)
+// ============================================================
+void emitMeasurementJson(float dist, float height, bool ok) {
+  if (ok) {
+    Serial.printf(
+      "{\"type\":\"measurement\",\"device\":\"smartheight-esp32\",\"sequence\":%lu,\"status\":\"ok\",\"distanceCm\":%.1f,\"heightCm\":%.1f,\"referenceHeightCm\":%.1f,\"offsetCm\":0.0,\"validSamples\":5,\"buzzerAlarm\":false,\"calibrated\":false}\n",
+      (unsigned long)(sequenceNumber++), dist, height, REFERENCE_HEIGHT_CM
+    );
+  } else {
+    Serial.printf(
+      "{\"type\":\"measurement\",\"device\":\"smartheight-esp32\",\"sequence\":%lu,\"status\":\"invalid\",\"error\":\"Di luar rentang pantulan\",\"distanceCm\":0.0,\"heightCm\":0.0,\"referenceHeightCm\":%.1f,\"offsetCm\":0.0,\"validSamples\":0,\"buzzerAlarm\":true,\"calibrated\":false}\n",
+      (unsigned long)(sequenceNumber++), REFERENCE_HEIGHT_CM
+    );
+  }
+}
+
+// ============================================================
 // PROSEDUR SETUP & VERIFIKASI AWAL
 // ============================================================
 void setup() {
@@ -498,13 +516,10 @@ void loop() {
       Serial.printf("  RFID 2 (HSPI): Version 0x%02X\n", rfid2.getFirmwareVersion());
     } else if (cmd == 'u' || cmd == 'U') {
       float testDist = 0.0f;
-      if (readUltrasonicDistance(testDist)) {
-        float testHeight = REFERENCE_HEIGHT_CM - testDist;
-        if (testHeight < 0.0f) testHeight = 0.0f;
-        Serial.printf("[COMMAND] HC-SR04 -> Jarak Sensor: %.2f cm | Estimasi Tinggi: %.2f cm\n", testDist, testHeight);
-      } else {
-        Serial.println(F("[COMMAND] HC-SR04 -> Out of Range / No Echo"));
-      }
+      bool ok = readUltrasonicDistance(testDist);
+      float testHeight = ok ? (REFERENCE_HEIGHT_CM - testDist) : 0.0f;
+      if (testHeight < 0.0f) testHeight = 0.0f;
+      emitMeasurementJson(testDist, testHeight, ok);
     }
   }
 
@@ -519,10 +534,6 @@ void loop() {
         Serial.print(F("[RFID 1 - PENDAFTARAN] Kartu Terdeteksi! UID: "));
         printUidString(rfid1.uid);
         Serial.printf(" (Panjang: %d byte)\n", rfid1.uid.size);
-        if (!isnan(latestEstimatedHeightCm)) {
-          Serial.printf("                       -> Terkait Tinggi Terukur: %.1f cm (Jarak: %.1f cm)\n",
-                        latestEstimatedHeightCm, latestDistanceCm);
-        }
         buzzerBeepSingle();
         rfid1.haltA();
       }
@@ -535,8 +546,8 @@ void loop() {
         Serial.print(F("[RFID 2 - AKSES WAHANA] Kartu Terdeteksi! UID: "));
         printUidString(rfid2.uid);
         Serial.printf(" (Panjang: %d byte)\n", rfid2.uid.size);
-        Serial.println(F("                       -> Validasi Gate: Kartu Diterima, Akses Wahana Terbuka"));
-        buzzerBeepSingle();
+        // Respon buzzer pada Reader 2 (bip sukses / gagal) dikendalikan interaktif
+        // oleh hasil verifikasi tinggi wahana dari dashboard via serial ('b' / 'n').
         rfid2.haltA();
       }
     }
@@ -552,12 +563,11 @@ void loop() {
       latestEstimatedHeightCm = REFERENCE_HEIGHT_CM - currentDistance;
       if (latestEstimatedHeightCm < 0.0f) latestEstimatedHeightCm = 0.0f;
 
-      Serial.printf("[HC-SR04] Jarak Sensor: %5.1f cm | Estimasi Tinggi Badan: %5.1f cm (Valid)\n",
-                    latestDistanceCm, latestEstimatedHeightCm);
+      emitMeasurementJson(latestDistanceCm, latestEstimatedHeightCm, true);
     } else {
       latestDistanceCm = NAN;
       latestEstimatedHeightCm = NAN;
-      Serial.println(F("[HC-SR04] Jarak Sensor: --.- cm | Estimasi Tinggi Badan: --.- cm (Di luar rentang)"));
+      emitMeasurementJson(0.0f, 0.0f, false);
     }
   }
 
