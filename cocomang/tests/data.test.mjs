@@ -5,6 +5,7 @@ import {
   createInitialState,
   addVisitor,
   addMember,
+  deleteMember,
   recordMeasurement,
   repository,
   validateDeviceFrame,
@@ -142,4 +143,24 @@ test('validates RFID input requirement on form registration', () => {
 
   const errInvalid = validateMember({ name: 'Member Uji', rfidUid: 'ZZ:99' }, { requireRfid: true });
   assert.match(errInvalid.rfidUid, /Format UID kartu RFID tidak valid/);
+});
+
+test('deleteMember removes member by id or rfidUid and prevents deleting unknown member', () => {
+  const state = createInitialState();
+  const m1 = addMember(state, { name: 'Member 1', rfidUid: '04:A1:B2:C3' });
+  const m2 = addMember(state, { name: 'Member 2', rfidUid: '10:20:30:40' });
+  assert.equal(state.visitors.length, 2);
+
+  // Delete by id
+  const removed1 = deleteMember(state, m1.id);
+  assert.equal(removed1.name, 'Member 1');
+  assert.equal(state.visitors.length, 1);
+
+  // Delete by rfidUid
+  const removed2 = deleteMember(state, '10:20:30:40');
+  assert.equal(removed2.name, 'Member 2');
+  assert.equal(state.visitors.length, 0);
+
+  // Delete non-existent
+  assert.throws(() => deleteMember(state, 'unknown-id'), /Member tidak ditemukan/);
 });

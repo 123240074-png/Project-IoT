@@ -1,7 +1,8 @@
-import { repository, addMember, addVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
+import { repository, addMember, addVisitor, deleteMember, deleteVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
 import { parseDeviceLine, parseRfidLine } from './serial-protocol.mjs';
 import { DEFAULT_RIDES, validateRideEligibility, createValidationRecord } from './ride-validator.mjs';
 import {
+  loadEnvConfig,
   getSupabaseConfig,
   saveSupabaseConfig,
   isConfigured as isSupabaseConfigured,
@@ -9,6 +10,7 @@ import {
   fetchMembers as fetchSupabaseMembers,
   upsertMember as upsertSupabaseMember,
   updateMemberHeight as updateSupabaseMemberHeight,
+  deleteMemberFromSupabase,
   fetchRides as fetchSupabaseRides,
   recordValidation as recordSupabaseValidation,
   syncLocalMembersToSupabase,
@@ -279,9 +281,9 @@ function genderText(value) {
 
 function memberTable() {
   if (!state.visitors.length) return '<div class="empty"><strong>Belum ada member terdaftar.</strong>Catat identitas kartu RFID dan data member sebelum menyimpan hasil pengukuran.<br><button class="text-button" data-action="add-member">Tambah member pertama</button></div>';
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="registry-table"><caption class="sr-only">Buku registrasi member</caption><thead><tr><th>No.</th><th>UID Kartu RFID</th><th>Nama</th><th>Usia</th><th>Jenis kelamin</th><th class="numeric">Berat badan</th><th class="numeric">Tinggi badan</th><th>Status pengukuran</th><th>Waktu pengukuran</th></tr></thead><tbody>${state.visitors.map((member, index) => {
+  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="registry-table"><caption class="sr-only">Buku registrasi member</caption><thead><tr><th>No.</th><th>UID Kartu RFID</th><th>Nama</th><th>Usia</th><th>Jenis kelamin</th><th class="numeric">Berat badan</th><th class="numeric">Tinggi badan</th><th>Status pengukuran</th><th>Waktu pengukuran</th><th>Aksi</th></tr></thead><tbody>${state.visitors.map((member, index) => {
     const measured = member.heightCm != null && Boolean(member.measuredAt);
-    return `<tr><td class="numeric row-index">${index + 1}</td><td><code class="rfid-badge">${escape(member.rfidUid || '—')}</code></td><td><strong class="visitor-name member-name">${escape(member.name)}</strong>${member.notes ? `<span class="row-note visitor-notes">${escape(member.notes)}</span>` : ''}</td><td class="numeric">${member.age ?? '—'}</td><td>${genderText(member.gender)}</td><td class="numeric">${member.weightKg == null ? '—' : `${fmt(member.weightKg)} kg`}</td><td class="numeric"><strong>${member.heightCm == null ? '—' : `${fmt(member.heightCm)} cm`}</strong>${measured ? '<span class="row-note">Dari sensor</span>' : ''}</td><td><span class="status ${measured ? 'good' : 'waiting'}">${measured ? 'Sudah diukur' : 'Belum diukur'}</span></td><td>${member.measuredAt ? when(member.measuredAt) : '—'}</td></tr>`;
+    return `<tr><td class="numeric row-index">${index + 1}</td><td><code class="rfid-badge">${escape(member.rfidUid || '—')}</code></td><td><strong class="visitor-name member-name">${escape(member.name)}</strong>${member.notes ? `<span class="row-note visitor-notes">${escape(member.notes)}</span>` : ''}</td><td class="numeric">${member.age ?? '—'}</td><td>${genderText(member.gender)}</td><td class="numeric">${member.weightKg == null ? '—' : `${fmt(member.weightKg)} kg`}</td><td class="numeric"><strong>${member.heightCm == null ? '—' : `${fmt(member.heightCm)} cm`}</strong>${measured ? '<span class="row-note">Dari sensor</span>' : ''}</td><td><span class="status ${measured ? 'good' : 'waiting'}">${measured ? 'Sudah diukur' : 'Belum diukur'}</span></td><td>${member.measuredAt ? when(member.measuredAt) : '—'}</td><td><button class="icon-button delete-member-btn" data-action="delete-member" data-id="${escape(member.id)}" data-name="${escape(member.name)}" data-rfid="${escape(member.rfidUid || '')}" title="Hapus member ${escape(member.name)}" aria-label="Hapus member">${svg('close')}</button></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -740,6 +742,7 @@ async function openSupabaseModal() {
 
   openModal('Pengaturan Database Supabase', 'Konfigurasi PostgreSQL Cloud untuk sinkronisasi multi-device & data wahana.', `<div class="form-grid">
     <div class="db-settings-status" id="db-status-box">Status saat ini: ${statusLabels[supabaseStatus] || statusLabels.unconfigured}</div>
+    ${cfg.fromEnv ? '<div class="notice" style="margin-bottom:12px;"><strong>Konfigurasi Otomatis:</strong> Kredensial saat ini dimuat langsung dari file <code>.env</code>.</div>' : ''}
     <div id="db-form-error" role="alert"></div>
     <div class="field">
       <label for="sb-url">Supabase Project URL <span class="req">*</span></label>
@@ -922,6 +925,24 @@ document.addEventListener('click', event => {
   if (!button || button.disabled) return;
   const action = button.dataset.action;
   if (action === 'add-member' || action === 'add-visitor') memberForm();
+  else if (action === 'delete-member') {
+    const id = button.dataset.id;
+    const name = button.dataset.name || 'Member';
+    const rfid = button.dataset.rfid;
+    if (!confirm(`Hapus member "${name}"${rfid ? ` (${rfid})` : ''}?\nData member akan dihapus secara permanen dari sistem.`)) return;
+
+    try {
+      commit(next => { deleteMember(next, id); });
+      if (selectedVisitorId === id) selectedVisitorId = '';
+      if (rfid && supabaseStatus === 'connected') {
+        void deleteMemberFromSupabase(rfid);
+      }
+      render();
+      toast(`Member "${name}" berhasil dihapus.`);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
   else if (action === 'connect') void connectDevice();
   else if (action === 'disconnect') void disconnectDevice();
   else if (action === 'save-reading') {
@@ -1014,6 +1035,8 @@ async function boot() {
   try {
     state = repository.load();
     route = normalizeRoute(location.hash);
+
+    await loadEnvConfig();
 
     if (isSupabaseConfigured()) {
       const cfg = getSupabaseConfig();

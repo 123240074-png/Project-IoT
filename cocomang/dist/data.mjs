@@ -103,6 +103,20 @@ export function addMember(state, input, now = new Date().toISOString()) {
 
 export const addVisitor = addMember;
 
+export function deleteMember(state, identifier) {
+  if (!state || !Array.isArray(state.visitors)) throw new Error('State tidak valid.');
+  const idStr = String(identifier ?? '').trim();
+  const cleanRfid = normalizeRfid(idStr);
+
+  const index = state.visitors.findIndex(m => m.id === idStr || (m.rfidUid && normalizeRfid(m.rfidUid) === cleanRfid));
+  if (index === -1) throw new Error('Member tidak ditemukan.');
+
+  const [removed] = state.visitors.splice(index, 1);
+  return removed;
+}
+
+export const deleteVisitor = deleteMember;
+
 export function validateDeviceFrame(frame) {
   if (!frame || typeof frame !== 'object') return 'Pesan perangkat tidak valid.';
   if (frame.device !== 'smartheight-esp32') return 'Identitas perangkat tidak dikenali.';

@@ -10,8 +10,67 @@ const SUPABASE_CDN_URL = 'https://esm.sh/@supabase/supabase-js@2?bundle';
 
 let supabaseClient = null;
 let realtimeChannel = null;
+let envConfig = null;
+
+/**
+ * Membaca kredensial Supabase dari file .env secara otomatis
+ */
+export async function loadEnvConfig() {
+  if (envConfig) return envConfig;
+
+  // 1. Cek Node.js environment variables jika tersedia
+  if (typeof process !== 'undefined' && process?.env) {
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+      envConfig = {
+        url: process.env.SUPABASE_URL.trim(),
+        anonKey: process.env.SUPABASE_ANON_KEY.trim(),
+        fromEnv: true,
+      };
+      return envConfig;
+    }
+  }
+
+  // 2. Cek file .env melalui fetch di browser
+  if (typeof fetch === 'function') {
+    const candidatePaths = ['.env', '/.env', '../.env'];
+    for (const path of candidatePaths) {
+      try {
+        const res = await fetch(path);
+        if (!res.ok) continue;
+        const text = await res.text();
+        const parsed = {};
+        for (const line of text.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const idx = trimmed.indexOf('=');
+          if (idx > 0) {
+            const k = trimmed.slice(0, idx).trim();
+            const v = trimmed.slice(idx + 1).trim().replace(/^["']|["']$/g, '');
+            parsed[k] = v;
+          }
+        }
+        const url = parsed.SUPABASE_URL || parsed.VITE_SUPABASE_URL || '';
+        const anonKey = parsed.SUPABASE_ANON_KEY || parsed.VITE_SUPABASE_ANON_KEY || '';
+        if (url && anonKey) {
+          envConfig = { url, anonKey, fromEnv: true };
+          return envConfig;
+        }
+      } catch {}
+    }
+  }
+
+  return null;
+}
 
 export function getSupabaseConfig() {
+  if (envConfig?.url && envConfig?.anonKey) {
+    return {
+      url: envConfig.url,
+      anonKey: envConfig.anonKey,
+      syncEnabled: true,
+      fromEnv: true,
+    };
+  }
   try {
     const raw = globalThis.localStorage?.getItem(SUPABASE_CONFIG_KEY);
     if (raw) return JSON.parse(raw);
@@ -20,6 +79,7 @@ export function getSupabaseConfig() {
     url: '',
     anonKey: '',
     syncEnabled: true,
+    fromEnv: false,
   };
 }
 
@@ -47,6 +107,7 @@ export function isConfigured() {
  */
 export async function getClient() {
   if (supabaseClient) return supabaseClient;
+  await loadEnvConfig();
   const cfg = getSupabaseConfig();
   if (!cfg.url || !cfg.anonKey) return null;
 
@@ -317,5 +378,25 @@ export async function subscribeToRealtime({ onMemberChange, onValidationChange }
   } catch (err) {
     console.warn('Realtime subscription error:', err);
     return null;
+  }
+}
+
+/**
+ * Menghapus data member dari database Supabase (cascade ke log validasi terkait).
+ */
+export async function deleteMemberFromSupabase(rfidUid) {
+  const client = await getClient();
+  if (!client || !rfidUid) return false;
+
+  try {
+    const { error } = await client
+      .from('members')
+      .delete()
+      .eq('rfid_uid', rfidUid);
+    if (error) throw error;
+    return true;
+  } catch (err) {
+    console.error('deleteMemberFromSupabase error:', err);
+    return false;
   }
 }

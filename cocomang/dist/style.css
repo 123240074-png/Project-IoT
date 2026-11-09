@@ -1758,3 +1758,14 @@ dialog::backdrop { background: rgba(23, 54, 42, 0.5); }
   padding: 1px 4px;
   border-radius: 3px;
 }
+
+.delete-member-btn {
+  color: #c94a38;
+  opacity: 0.65;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.delete-member-btn:hover {
+  opacity: 1;
+  background: rgba(201, 74, 56, 0.12);
+}

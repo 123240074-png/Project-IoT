@@ -39,19 +39,23 @@ Panduan langkah demi langkah untuk mengaktifkan database cloud **Supabase** (Pos
 
 ---
 
-## 4. Menghubungkan ke Dashboard COCOMANG
+## 4. Konfigurasi Kredensial via File `.env` (Praktis & Otomatis)
 
-1. Jalankan web dashboard secara lokal:
+Kamu dapat menyimpan kredensial langsung ke file `.env` tanpa perlu memasukkannya berulang kali di browser:
+
+1. Buat file `.env` di dalam folder `cocomang/dist/` (atau salin dari `.env.example`):
    ```powershell
-   cd cocomang
-   py -m http.server 8000 --directory dist
+   Copy-Item cocomang/dist/.env.example cocomang/dist/.env
    ```
-2. Buka browser Chromium (Edge / Chrome) di `http://localhost:8000`.
-3. Pada header navigasi atas, klik tombol status Supabase: **`⚪ Setel Supabase`** (atau `🟡 Mode Lokal`).
-4. Masukkan **Project URL** dan **Anon Public Key** yang sudah kamu salin.
-5. Klik **Tes Koneksi** → Pastikan muncul tanda hijau: *Sukses: Terhubung ke database Supabase!*
-6. Klik **Simpan Pengaturan**. Status di header akan berubah menjadi **`🟢 Cloud Terhubung`**.
-7. Jika kamu sudah memiliki data member lokal di browser, klik **"Sinkronkan Data Lokal ke Cloud"** untuk mengunggahnya ke Supabase secara otomatis.
+2. Buka file `cocomang/dist/.env` dan masukkan kredensial Supabase kamu:
+   ```env
+   SUPABASE_URL=https://xyzcompany.supabase.co
+   SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+   ```
+3. File `.env` sudah masuk ke dalam `.gitignore` sehingga aman dari commit git.
+4. Saat dashboard dibuka (`http://localhost:8000`), dashboard otomatis mendeteksi file `.env`, menguji koneksi, dan status di header langsung berubah menjadi **`🟢 Cloud Terhubung`**!
+
+*(Alternatif: Jika tidak ingin menggunakan file `.env`, kamu tetap bisa memasukkan URL & Key secara manual melalui tombol status Supabase di header dashboard).*
 
 ---
 
