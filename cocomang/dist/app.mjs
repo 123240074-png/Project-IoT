@@ -1,6 +1,7 @@
 import { repository, addMember, addVisitor, deleteMember, deleteVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
 import { parseDeviceLine, parseRfidLine } from './serial-protocol.mjs';
 import { DEFAULT_RIDES, validateRideEligibility, createValidationRecord } from './ride-validator.mjs';
+import { connectWokwi, disconnectWokwi, sendWokwiCommand, isWokwiConnected } from './wokwi-service.mjs';
 import {
   loadEnvConfig,
   getSupabaseConfig,
@@ -52,7 +53,7 @@ function normalizeRoute(hash) {
 let state;
 let route = normalizeRoute(location.hash);
 let selectedVisitorId = '';
-let serialSession = null;
+let wokwiStatus = 'offline'; // 'offline' | 'connecting' | 'connected' | 'error'
 let latestFrame = null;
 let lastFrameAt = 0;
 let lastSavedSequence = null;
@@ -125,13 +126,14 @@ function frameNow() {
 }
 
 function isLive() {
-  return Boolean(serialSession && lastFrameAt && Date.now() - lastFrameAt <= 3000);
+  return Boolean(wokwiStatus === 'connected' && lastFrameAt && Date.now() - lastFrameAt <= 3000);
 }
 
 function statusPill() {
-  if (!serialSession) return '<span class="pill offline"><i></i>ESP32 terputus</span>';
+  if (wokwiStatus === 'offline') return '<span class="pill offline"><i></i>Wokwi terputus</span>';
+  if (wokwiStatus === 'connecting') return '<span class="pill waiting"><i></i>Menghubungkan…</span>';
   if (!isLive()) return '<span class="pill waiting"><i></i>Menunggu data</span>';
-  return '<span class="pill online"><i></i>Data live diterima</span>';
+  return '<span class="pill online"><i></i>Data Wokwi live</span>';
 }
 
 function cloudPill() {
@@ -144,13 +146,14 @@ function cloudPill() {
 }
 
 function connectionInfo() {
-  if (!serialSession) return { label:'Terputus', tone:'offline' };
+  if (wokwiStatus === 'offline') return { label:'Terputus', tone:'offline' };
+  if (wokwiStatus === 'connecting') return { label:'Koneksi…', tone:'waiting' };
   if (!isLive()) return { label:'Siaga', tone:'waiting' };
   return { label:'Live', tone:'online' };
 }
 
 function sensorInfo() {
-  if (!serialSession) return { label:'Tidak aktif', tone:'waiting' };
+  if (wokwiStatus !== 'connected') return { label:'Tidak aktif', tone:'waiting' };
   if (!lastFrameAt) return { label:'Menunggu echo', tone:'waiting' };
   if (Date.now() - lastFrameAt > 3000) return { label:'Data kedaluwarsa', tone:'waiting' };
   if (latestFrame?.status === 'invalid') return { label:'Echo tidak valid', tone:'alarm' };
@@ -173,7 +176,7 @@ function buzzerInfo(frame) {
 function frameAgeText() {
   if (!lastFrameAt) {
     if (latestFrame?.status === 'invalid') return 'Pembacaan tidak valid diterima';
-    return serialSession ? 'Menunggu baris data dari ESP32' : 'Menunggu koneksi perangkat';
+    return wokwiStatus === 'connected' ? 'Menunggu telemetry dari Wokwi' : 'Simulator belum terhubung';
   }
   const age = Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000));
   const relative = age === 0 ? 'baru saja' : age < 60 ? `${age} detik lalu` : `${Math.round(age / 60)} menit lalu`;
@@ -182,7 +185,7 @@ function frameAgeText() {
 
 function captureState() {
   const frame = frameNow();
-  if (!serialSession) return { ready:false, label:'ESP32 belum terhubung', tone:'waiting' };
+  if (wokwiStatus !== 'connected') return { ready:false, label:'Wokwi belum terhubung', tone:'waiting' };
   if (latestFrame?.status === 'invalid') return { ready:false, label:'Pembacaan tidak valid', tone:'alarm' };
   if (!frame) return { ready:false, label:'Menunggu data valid', tone:'waiting' };
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) return { ready:false, label:'Data sensor kedaluwarsa', tone:'waiting' };
@@ -201,7 +204,7 @@ function summaryCell(label, value, unit, note) {
 
 function liveReadout(prefix = 'live') {
   const frame = frameNow();
-  const link = { label: serialSession ? 'Terhubung' : 'Terputus', tone: serialSession ? 'good' : 'waiting' };
+  const link = { label: wokwiStatus === 'connected' ? 'Terhubung' : 'Terputus', tone: wokwiStatus === 'connected' ? 'good' : 'waiting' };
   const sensor = sensorInfo();
   const calibration = calibrationInfo(frame);
   const buzzer = buzzerInfo(frame);
@@ -219,7 +222,7 @@ function liveReadout(prefix = 'live') {
         <span class="reading-meta" id="${prefix}-last">${frameAgeText()}</span>
       </div>
       <div class="live-device">
-        <div class="device-line"><span>ESP32</span><strong class="device-status ${link.tone}" id="${prefix}-device-status">${link.label}</strong></div>
+        <div class="device-line"><span>ESP32 (Wokwi)</span><strong class="device-status ${link.tone}" id="${prefix}-device-status">${link.label}</strong></div>
         <div class="device-line"><span>HC-SR04</span><strong class="device-status ${sensor.tone}" id="${prefix}-sensor-status">${sensor.label}</strong></div>
         <div class="device-line"><span>Buzzer</span><strong class="device-status ${buzzer.tone}" id="${prefix}-alarm" title="${escape(buzzer.note)}">${buzzer.label}</strong></div>
       </div>
@@ -250,18 +253,18 @@ function dashboardPage() {
         <span class="latest-time">${when(latest.capturedAt)} WIB · jarak ${fmt(latest.distanceCm)} cm</span>
       </div>
       ${previous.length ? `<ul class="latest-list" aria-label="Pengukuran sebelumnya">${previous.map(row => `<li class="latest-row"><div><span class="latest-row-name">${escape(row.visitorName)}</span><span class="latest-row-time">${when(row.capturedAt)}</span></div><span class="latest-row-value">${fmt(row.heightCm)} cm</span></li>`).join('')}</ul>` : ''}`
-    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan ESP32, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
+    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan simulator Wokwi, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
   return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('cable')} Buka pengukuran live</a>`)
     + `<section class="summary-strip" aria-label="Ringkasan operasional">
         ${summaryCell('Member', state.visitors.length, 'orang', `${measuredMembers} sudah diukur`)}
         ${summaryCell('Sudah diukur', measuredMembers, 'orang', 'Memiliki hasil sensor')}
         ${summaryCell('Belum diukur', unmeasuredMembers, 'orang', 'Menunggu pos ukur')}
         ${summaryCell('Hasil tersimpan', state.measurements.length, 'data', `${measuredToday} hari ini · WIB`)}
-        <div class="summary-cell" id="device-connection-metric"><span class="summary-label">Koneksi perangkat</span><span class="summary-value summary-status ${connection.tone}" id="device-connection-value">${connection.label}</span><span class="summary-note">ESP32 · USB Serial 115200</span></div>
+        <div class="summary-cell" id="device-connection-metric"><span class="summary-label">Koneksi perangkat</span><span class="summary-value summary-status ${connection.tone}" id="device-connection-value">${connection.label}</span><span class="summary-note">ESP32 · Wokwi MQTT (HiveMQ)</span></div>
       </section>
       <div class="summary-grid">
         <section class="panel instrument-panel summary-instrument">
-          <div class="panel-header"><div><p class="instrument-kicker">Peralatan pengukuran</p><h2>ESP32 · HC-SR04</h2><p>Pembacaan fisik melalui USB Serial · 115200 baud</p></div>${statusPill()}</div>
+          <div class="panel-header"><div><p class="instrument-kicker">Peralatan pengukuran</p><h2>ESP32 · HC-SR04</h2><p>Simulasi Wokwi · MQTT over WebSocket</p></div>${statusPill()}</div>
           ${liveReadout('dash')}
         </section>
         <section class="panel latest-panel">
@@ -328,7 +331,7 @@ function validationBannerView() {
 }
 
 function measurementPage() {
-  return header('Pengukuran live & validasi wahana', 'Instrumen membaca HC-SR04 dari atas kepala. Reader 1 untuk pendaftaran, Reader 2 untuk validasi batas tinggi wahana.')
+  return header('Pengukuran live & validasi wahana', 'Instrumen membaca HC-SR04 dari atas kepala via simulator Wokwi. Reader 1 untuk pendaftaran, Reader 2 untuk validasi batas tinggi wahana.')
     + heightMeasurementView();
 }
 
@@ -336,9 +339,9 @@ function heightMeasurementView() {
   const readiness = captureState();
   return `<div class="measurement-layout">
       <section class="panel instrument-panel device-panel">
-        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>Web Serial · 115200 baud · Dual MFRC522</p></div>${statusPill()}</div>
-        <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${serialSession ? 'disabled' : ''}>${svg('cable')} Hubungkan ESP32</button><button class="btn" id="disconnect-device" data-action="disconnect" ${serialSession ? '' : 'disabled'}>Putuskan</button></div>
-        <p class="device-note" id="serial-help">Tutup Serial Monitor Arduino IDE sebelum menghubungkan perangkat. Gunakan Chrome atau Edge desktop melalui localhost atau HTTPS.</p>
+        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Simulator Wokwi</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>MQTT over WebSocket · broker.hivemq.com · Dual MFRC522</p></div>${statusPill()}</div>
+        <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${wokwiStatus === 'connected' ? 'disabled' : ''}>${svg('cable')} Hubungkan Wokwi</button><button class="btn" id="disconnect-device" data-action="disconnect" ${wokwiStatus === 'connected' ? '' : 'disabled'}>Putuskan</button><button class="btn" data-action="test-beep" title="Uji Bunyi Buzzer Wokwi" ${wokwiStatus === 'connected' ? '' : 'disabled'}>Tes Bip</button></div>
+        <p class="device-note" id="serial-help">Buka dan jalankan simulasi di Wokwi (diagram.json). Data sensor dan tap RFID terkirim nirkabel via MQTT WebSocket tanpa kabel serial USB.</p>
         ${liveReadout('measure')}
       </section>
       <section class="panel capture-panel">
@@ -469,9 +472,9 @@ function render() {
 }
 
 function updateConnectionUI() {
-  const connected = Boolean(serialSession);
+  const connected = (wokwiStatus === 'connected');
   const live = isLive();
-  const stateText = !connected ? 'ESP32 terputus' : live ? 'Data live diterima' : 'Menunggu data';
+  const stateText = !connected ? 'Wokwi terputus' : live ? 'Data Wokwi live' : 'Menunggu data';
   $$('.pill').forEach(element => {
     element.className = `pill ${!connected ? 'offline' : live ? 'online' : 'waiting'}`;
     element.innerHTML = `<i></i>${stateText}`;
@@ -522,16 +525,8 @@ function updateConnectionUI() {
   }
 }
 
-async function sendSerialCommand(cmd) {
-  if (!serialSession?.port?.writable) return;
-  try {
-    const writer = serialSession.port.writable.getWriter();
-    const encoder = new TextEncoder();
-    await writer.write(encoder.encode(cmd + '\n'));
-    writer.releaseLock();
-  } catch (err) {
-    console.warn('Gagal mengirim perintah serial ke ESP32:', err);
-  }
+function sendDeviceCommand(cmd) {
+  sendWokwiCommand(cmd);
 }
 
 async function handleRideValidation(member, readerId = 2) {
@@ -554,10 +549,10 @@ async function handleRideValidation(member, readerId = 2) {
   }
 
   if (evaluation.eligible) {
-    await sendSerialCommand('b'); // Bip 1x normal
+    sendDeviceCommand('b'); // Bip 1x normal di simulator Wokwi
     toast(`[VALIDASI] ${member.name} LOLOS masuk wahana ${ride.name}!`);
   } else {
-    await sendSerialCommand('n'); // Bip 3x peringatan
+    sendDeviceCommand('n'); // Bip 3x peringatan di simulator Wokwi
     toast(`[VALIDASI] ${member.name} DITOLAK: ${evaluation.reason}`, true);
   }
 
@@ -599,7 +594,7 @@ function processSerialLine(line) {
         updateConnectionUI();
         void handleRideValidation(matchedMember, 2);
       } else {
-        void sendSerialCommand('n');
+        sendDeviceCommand('n');
         toast(`Kartu RFID ${rfidEvent.uid} di Reader Akses belum terdaftar sebagai member.`, true);
       }
       return;
@@ -627,62 +622,40 @@ function processSerialLine(line) {
 }
 
 async function connectDevice() {
-  if (!('serial' in navigator)) {
-    toast('Web Serial tidak tersedia. Gunakan Chrome atau Edge desktop melalui localhost atau HTTPS.', true);
-    return;
-  }
-  if (serialSession) return;
-  let port;
+  if (wokwiStatus === 'connected' || wokwiStatus === 'connecting') return;
+  toast('Menghubungkan ke simulator Wokwi (MQTT over WebSocket)…');
   try {
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
-    const session = { port, reader: null, cancelled: false };
-    serialSession = session;
-    latestFrame = null;
-    lastFrameAt = 0;
-    lastSavedSequence = null;
-    updateConnectionUI();
-    toast('ESP32 terhubung. Menunggu data live dari firmware…');
-
-    const reader = port.readable.getReader();
-    session.reader = reader;
-    const decoder = new TextDecoder();
-    let buffer = '';
-    try {
-      while (!session.cancelled) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let newlineIndex;
-        while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
-          buffer = buffer.slice(newlineIndex + 1);
-          processSerialLine(line);
+    await connectWokwi({
+      onMessage: (message) => {
+        processSerialLine(message);
+      },
+      onStatusChange: (status, error) => {
+        wokwiStatus = status;
+        if (status === 'connected') {
+          latestFrame = null;
+          lastFrameAt = 0;
+          lastSavedSequence = null;
+          toast('Simulator Wokwi terhubung! Siap menerima telemetry sensor & RFID.');
+        } else if (status === 'offline') {
+          toast('Koneksi simulator Wokwi terputus.');
+        } else if (status === 'error') {
+          toast(`Koneksi Wokwi error: ${error?.message || error}`, true);
         }
-        if (buffer.length > 4096) buffer = buffer.slice(-2048);
+        updateConnectionUI();
       }
-    } finally {
-      try { reader.releaseLock(); } catch {}
-    }
+    });
   } catch (error) {
-    const message = error?.name === 'NotFoundError' ? 'Pemilihan port dibatalkan.' : error?.message || 'Tidak dapat membuka port serial.';
-    if (error?.name !== 'NotFoundError') toast(`${message} Pastikan Serial Monitor ditutup dan port tidak dipakai aplikasi lain.`, true);
-  } finally {
-    if (serialSession?.port === port) {
-      serialSession = null;
-      try { if (port?.readable) await port.close(); } catch {}
-      updateConnectionUI();
-      if (port) toast('Koneksi ESP32 terputus.');
-    }
+    wokwiStatus = 'error';
+    updateConnectionUI();
+    toast(`Gagal terhubung ke broker Wokwi: ${error?.message || error}`, true);
   }
 }
 
 async function disconnectDevice() {
-  const session = serialSession;
-  if (!session) return;
-  session.cancelled = true;
-  try { await session.reader?.cancel(); } catch {}
-  try { if (session.port?.readable) await session.port.close(); } catch {}
+  disconnectWokwi();
+  wokwiStatus = 'offline';
+  updateConnectionUI();
+  toast('Koneksi simulator Wokwi diputuskan.');
 }
 
 function openModal(title, subtitle, content) {
@@ -697,7 +670,7 @@ function memberForm(prefillRfid = '') {
     <div class="field">
       <label for="member-rfid">UID Kartu RFID <span class="req">*</span></label>
       <input id="member-rfid" name="rfidUid" required autocomplete="off" spellcheck="false" placeholder="Contoh: 04:A1:B2:C3 atau 04A1B2C3" value="${escape(initialRfid)}">
-      <p class="field-help">${serialSession ? 'Dekatkan kartu ke Reader 1 (Pendaftaran) atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
+      <p class="field-help">${wokwiStatus === 'connected' ? 'Dekatkan kartu ke Reader 1 (Pendaftaran) di simulator atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
     </div>
     <div class="field"><label for="member-name">Nama lengkap <span class="req">*</span></label><input id="member-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama member"></div>
     <div class="field-row">
@@ -815,7 +788,7 @@ async function openSupabaseModal() {
 }
 
 async function saveLiveReading() {
-  if (!serialSession) throw new Error('ESP32 belum terhubung.');
+  if (wokwiStatus !== 'connected') throw new Error('Simulator Wokwi belum terhubung.');
   if (!latestFrame || latestFrame.status !== 'ok') throw new Error('Belum ada pembacaan live yang valid dari ESP32.');
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) throw new Error('Data sensor sudah kedaluwarsa. Tunggu pembacaan live berikutnya.');
   if (!selectedVisitorId) throw new Error('Pilih member terlebih dahulu.');
@@ -889,18 +862,18 @@ function printPdfReport() {
   const body = rows.map((row, index) => `<tr><td>${index + 1}</td><td>${escape(when(row.capturedAt))}</td><td>${escape(row.visitorName)}</td><td><code class="rfid-badge">${escape(row.memberRfid || '—')}</code></td><td>${fmt(row.heightCm)}</td><td>${fmt(row.distanceCm)}</td><td>${row.buzzerAlarm ? 'Ambang &lt; 100 cm' : 'Normal'}</td><td>${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</td></tr>`).join('');
   printWindow.document.write(`<!doctype html><html lang="id"><head><meta charset="utf-8"><title>Laporan Pengukuran COCOMANG</title><style>
     @page{size:A4;margin:16mm}*{box-sizing:border-box}body{font:11px Arial,sans-serif;color:#243c32;margin:0}h1{font-family:Georgia,serif;font-size:22px;font-weight:600;margin:2px 0 4px}p{color:#59675d;line-height:1.5;margin:0}.brandline{display:flex;align-items:baseline;gap:10px;border-top:3px solid #254b3e;padding-top:12px}.brandline strong{font-size:16px;letter-spacing:.08em}.brandline span{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#59675d}.meta{border-bottom:1px solid #b9c1ad;padding-bottom:12px;margin-bottom:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0}.summary div{border:1px solid #cbd3c5;padding:9px 10px}.summary span{display:block;color:#59675d;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.summary strong{display:block;font-size:17px;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #cbd3c5;padding:7px 6px;text-align:left;font-size:9px}th{background:#eef0e7;font-size:8px;text-transform:uppercase;letter-spacing:.05em}td:nth-child(1),td:nth-child(5),td:nth-child(6){font-variant-numeric:tabular-nums}.rfid-badge{display:inline-block;padding:1px 5px;font-family:monospace;font-size:8.5px;background:#eef0e7;border:1px solid #cbd3c5;border-radius:3px}.foot{margin-top:18px;font-size:9px;color:#657064;border-top:1px solid #cbd3c5;padding-top:8px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan Member</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui Web Serial</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Member</th><th>UID RFID</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
+    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan Member</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 (Simulasi Wokwi MQTT)</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Member</th><th>UID RFID</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi simulasi Wokwi dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
   printWindow.document.close();
 }
 
 function showHelp() {
-  openModal('Petunjuk perangkat & Supabase', 'Koneksi, Dual RFID, dan integrasi cloud COCOMANG.', `<ul class="help-list">
-    <li>Gunakan Chrome atau Edge versi desktop melalui <strong>http://localhost:8000</strong> atau HTTPS.</li>
-    <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32. Baud rate 115200.</li>
+  openModal('Petunjuk Pengetesan Wokwi & Supabase', 'Koneksi nirkabel MQTT, Dual RFID, dan sinkronisasi cloud.', `<ul class="help-list">
+    <li><strong>Simulator Wokwi:</strong> Jalankan simulasi pada file <code>cocomang/firmware/smartheight_wokwi/</code>.</li>
+    <li><strong>Koneksi Nirkabel:</strong> Dashboard terhubung via MQTT over WebSocket ke broker publik (<code>broker.hivemq.com</code>). Tidak memerlukan koneksi kabel Serial USB.</li>
     <li><strong>Dual RFID:</strong> Reader 1 untuk pendaftaran member baru, Reader 2 untuk validasi akses wahana.</li>
     <li><strong>Buzzer Pasif:</strong> Menghasilkan 1x bip saat lolos syarat wahana, dan 3x bip saat tinggi badan kurang.</li>
-    <li><strong>Supabase PostgreSQL:</strong> Klik tombol status Supabase di header untuk mengisi URL & Anon Key.</li>
-    <li>Data tetap aman tersimpan lokal di browser meskipun tidak ada koneksi internet.</li>
+    <li><strong>Supabase PostgreSQL:</strong> Klik tombol status Supabase di header untuk mengisi URL & Anon Key. Data member dan log kelayakan wahana otomatis tersimpan di cloud.</li>
+    <li>Data pengukuran juga tetap aman tersimpan secara offline di LocalStorage peramban.</li>
     </ul><div class="modal-actions"><button class="btn primary" data-action="close-modal">Mengerti</button></div>`);
 }
 
@@ -945,6 +918,10 @@ document.addEventListener('click', event => {
   }
   else if (action === 'connect') void connectDevice();
   else if (action === 'disconnect') void disconnectDevice();
+  else if (action === 'test-beep') {
+    sendDeviceCommand('b');
+    toast('Mengirim sinyal uji bip ke Buzzer simulator Wokwi.');
+  }
   else if (action === 'save-reading') {
     try { void saveLiveReading(); } catch (error) { toast(error.message, true); }
   }
@@ -982,7 +959,7 @@ window.addEventListener('storage', event => {
 });
 
 setInterval(() => {
-  if (serialSession) updateConnectionUI();
+  if (wokwiStatus === 'connected') updateConnectionUI();
 }, 1000);
 
 async function initCloudData() {
@@ -1050,6 +1027,7 @@ async function boot() {
     }
 
     render();
+    void connectDevice();
   } catch (error) {
     $('#app').innerHTML = `<main class="boot"><div><h1>Data belum dapat dibuka</h1><p>${escape(error.message)}</p></div></main>`;
   }

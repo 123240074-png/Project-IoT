@@ -1,0 +1,219 @@
+{
+  "version": 1,
+  "author": "Smart Height Measurement - Wokwi Simulation Edition",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "board-mfrc522",
+      "id": "rfid1",
+      "top": -40,
+      "left": 230,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "ultra",
+      "top": 150,
+      "left": 230,
+      "attrs": {
+        "distance": "130"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 190,
+      "left": 400,
+      "rotate": 90,
+      "attrs": {
+        "value": "1000"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r2",
+      "top": 270,
+      "left": 440,
+      "rotate": 90,
+      "attrs": {
+        "value": "2000"
+      }
+    },
+    {
+      "type": "wokwi-buzzer",
+      "id": "bz1",
+      "top": 60,
+      "left": -120,
+      "attrs": {
+        "volume": "0.1"
+      }
+    },
+    {
+      "type": "board-mfrc522",
+      "id": "rfid2",
+      "top": -213.85,
+      "left": 430,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [
+      "esp:TX0",
+      "$serialMonitor:RX",
+      "",
+      []
+    ],
+    [
+      "esp:RX0",
+      "$serialMonitor:TX",
+      "",
+      []
+    ],
+    [
+      "rfid1:SDA",
+      "esp:D5",
+      "green",
+      []
+    ],
+    [
+      "rfid1:SCK",
+      "esp:D18",
+      "blue",
+      []
+    ],
+    [
+      "rfid1:MOSI",
+      "esp:D23",
+      "purple",
+      []
+    ],
+    [
+      "rfid1:MISO",
+      "esp:D19",
+      "orange",
+      []
+    ],
+    [
+      "rfid1:RST",
+      "esp:D22",
+      "yellow",
+      []
+    ],
+    [
+      "rfid1:3.3V",
+      "esp:3V3",
+      "red",
+      []
+    ],
+    [
+      "rfid1:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "rfid2:SDA",
+      "esp:D4",
+      "green",
+      []
+    ],
+    [
+      "rfid2:SCK",
+      "esp:D14",
+      "blue",
+      []
+    ],
+    [
+      "rfid2:MOSI",
+      "esp:D13",
+      "purple",
+      []
+    ],
+    [
+      "rfid2:MISO",
+      "esp:D32",
+      "orange",
+      []
+    ],
+    [
+      "rfid2:RST",
+      "esp:D21",
+      "yellow",
+      []
+    ],
+    [
+      "rfid2:3.3V",
+      "esp:3V3",
+      "red",
+      []
+    ],
+    [
+      "rfid2:GND",
+      "esp:GND.1",
+      "black",
+      []
+    ],
+    [
+      "ultra:VCC",
+      "esp:VIN",
+      "red",
+      []
+    ],
+    [
+      "ultra:GND",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "ultra:TRIG",
+      "esp:D25",
+      "green",
+      []
+    ],
+    [
+      "ultra:ECHO",
+      "r1:1",
+      "orange",
+      []
+    ],
+    [
+      "r1:2",
+      "esp:D26",
+      "orange",
+      []
+    ],
+    [
+      "r2:1",
+      "r1:2",
+      "orange",
+      []
+    ],
+    [
+      "r2:2",
+      "esp:GND.2",
+      "black",
+      []
+    ],
+    [
+      "bz1:2",
+      "esp:D27",
+      "green",
+      []
+    ],
+    [
+      "bz1:1",
+      "esp:GND.1",
+      "black",
+      []
+    ]
+  ],
+  "dependencies": {}
+}
