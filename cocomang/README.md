@@ -1,117 +1,186 @@
-# COCOMANG SmartHeight — Live USB Serial
+# COCOMANG SmartHeight — Wokwi Simulation & Cloud Sync
 
-Dashboard pengujian physical layer untuk proyek Smart Height Measurement. Versi ini disesuaikan dengan progres terakhir: **ESP32 DevKit V1 + HC-SR04 + buzzer pasif + LCD I2C**, dengan dua mode pada Pengukuran live: pengukuran tinggi dan deteksi objek untuk dataset kalibrasi. Tidak menggunakan RFID/RC522, NFC, Firebase, Telegram, load cell, atau servo.
+Pos sistem pengukuran tinggi badan otomatis dan validasi akses wahana rekreasi berbasis **ESP32 DevKit V1 + Dual RFID MFRC522 (VSPI & HSPI) + Sensor Ultrasonik HC-SR04 + Buzzer Pasif**, disimulasikan secara nirkabel melalui **Wokwi Simulator (WiFi + MQTT over WebSocket)**, terhubung ke dashboard web tanpa ketergantungan serial fisik, serta disinkronkan ke database cloud **Supabase (PostgreSQL & Realtime)**.
 
-## Cara kerja saat ini
+---
 
-1. Firmware ESP32 membaca HC-SR04 dan menghitung estimasi tinggi.
-2. Buzzer ESP32 aktif ketika estimasi tinggi **kurang dari 100 cm**.
-3. LCD I2C menampilkan jarak dan estimasi tinggi.
-4. Firmware live mode mengambil 3 sampel, memakai median, lalu mengirim satu baris JSON sekitar setiap 300 ms melalui USB Serial pada 115200 baud. Untuk kalibrasi akhir, gunakan 5 sampel dan interval sekitar 650 ms agar pembacaan lebih tahan terhadap noise.
-5. Dashboard COCOMANG membaca USB Serial langsung melalui Web Serial API.
-6. Petugas memilih nama pengunjung dan menekan **Simpan hasil live**. Pembacaan live tidak otomatis memenuhi riwayat agar tabel tidak dipenuhi sampel berulang.
-7. Mode **Deteksi objek** menguji kestabilan 5 frame valid berturut-turut terhadap target default 20–60 cm dengan toleransi 2 cm. Jarak sensor dan jarak aktual meteran ditampilkan sebelum snapshot eksplisit.
-8. Snapshot pengujian objek disimpan sebagai dataset kalibrasi terpisah, bukan riwayat pengunjung, dan dapat diekspor ke CSV.
-9. Riwayat tinggi dapat difilter berdasarkan rentang tanggal, nama, status buzzer, status kalibrasi, serta diurutkan menurut waktu atau tinggi.
-10. Riwayat dapat diekspor ke CSV atau dicetak lalu disimpan sebagai PDF dari dialog browser.
+## 📋 Ikhtisar & Arsitektur Sistem
 
-## Persyaratan
+Branch ini mengimplementasikan integrasi simulasi nirkabel Wokwi untuk mempermudah demonstrasi dan pengujian perangkat lunak tanpa membutuhkan perangkat keras fisik di meja kerja:
 
-- ESP32 DevKit V1 dan kabel USB data.
-- HC-SR04 dengan pembagi tegangan ECHO 1 kΩ / 2 kΩ ke GPIO 26.
-- Buzzer pasif pada GPIO 27.
-- LCD I2C pada SDA GPIO 21 dan SCL GPIO 22.
-- Arduino IDE untuk mengunggah firmware.
-- Google Chrome atau Microsoft Edge desktop yang mendukung Web Serial API.
-- Python 3 untuk menjalankan server statis lokal.
+```mermaid
+flowchart LR
+    subgraph Wokwi ["Wokwi Simulator (ESP32)"]
+        R1["RFID 1 (Pendaftaran - VSPI)"] --> ESP["ESP32 DevKit V1"]
+        R2["RFID 2 (Akses Wahana - HSPI)"] --> ESP
+        US["Sensor HC-SR04 (Ultrasonik)"] --> ESP
+        ESP --> BZ["Buzzer Pasif (GPIO 27)"]
+        ESP -->|"WiFi (Wokwi-GUEST)"| MQTT_OUT["PubSubClient (Port 1883)"]
+    end
 
-## Wiring
+    subgraph HiveMQ ["HiveMQ Public MQTT Broker"]
+        BROKER["broker.hivemq.com"]
+    end
 
-| Komponen | ESP32 |
-|---|---|
-| HC-SR04 VCC | VIN / 5V |
-| HC-SR04 TRIG | GPIO 25 |
-| HC-SR04 ECHO | GPIO 26 melalui divider 1 kΩ (seri) + 2 kΩ (ke GND) |
-| HC-SR04 GND | GND |
-| Buzzer pasif (+) | GPIO 27 |
-| Buzzer pasif (-) | GND |
-| LCD I2C SDA | GPIO 21 |
-| LCD I2C SCL | GPIO 22 |
-| LCD I2C VCC | Sesuai spesifikasi modul; umumnya 5V |
-| LCD I2C GND | GND |
+    subgraph Dashboard ["Web Dashboard (Vanilla ES Modules)"]
+        WS["MQTT.js over WebSocket (Port 8884)"]
+        UI["Pos Ukur & Ride Validator"]
+        LOCAL["localStorage (Local-First)"]
+        WS <--> UI
+        UI <--> LOCAL
+    end
 
-**Peringatan level logika:** bila backpack LCD diberi 5V dan pull-up SDA/SCL-nya menuju 5V, pasang bidirectional I2C logic-level converter antara backpack dan ESP32. Jangan biarkan GPIO ESP32 menerima sinyal I2C 5V. Semua GND harus tersambung bersama.
+    subgraph Cloud ["Supabase Cloud"]
+        DB["PostgreSQL (members, rides, validations)"]
+        REALTIME["WebSocket Realtime Channel"]
+    end
 
-## Mengatur firmware
-
-Buka `firmware/smartheight_progres2_dual_rfid/smartheight_progres2_dual_rfid.ino` dengan Arduino IDE. Firmware mendukung Dual SPI MFRC522 (VSPI & HSPI), HC-SR04, dan Buzzer Pasif.
-
-Periksa nilai berikut sebelum pengujian manusia:
-
-```cpp
-static const float REFERENCE_HEIGHT_CM = 220.0f; // ganti dengan tinggi fisik aktual
-static const float CALIBRATION_OFFSET_CM = 0.0f; // isi setelah kalibrasi jarak
-static const bool CALIBRATION_CONFIRMED = false; // ubah true setelah validasi selesai
-static const float HEIGHT_ALARM_LIMIT_CM = 100.0f;
+    MQTT_OUT -->|"TCP MQTT"| BROKER
+    BROKER <-->|"WSS MQTT"| WS
+    UI <-->|"REST & Realtime"| Cloud
 ```
 
-- `REFERENCE_HEIGHT_CM`: jarak dari lantai ke permukaan depan transduser HC-SR04 setelah perangkat dipasang.
-- `CALIBRATION_OFFSET_CM`: koreksi jarak berdasarkan pengujian dengan penggaris/meteran.
-- `CALIBRATION_CONFIRMED`: hanya menjadi penanda status pada dashboard, bukan pengganti proses kalibrasi.
-- Buzzer aktif ketika `heightCm < 100`. Pada tepat 100 cm, buzzer tidak aktif.
+### Keunggulan Utama:
+- **Zero Web Serial Dependency**: Dashboard berkomunikasi secara nirkabel melalui **MQTT over WebSocket** (`wss://broker.hivemq.com:8884/mqtt`). Tidak membutuhkan kabel USB data, izin COM port peramban, ataupun browser khusus Chromium (dapat diakses dari Firefox, Safari, smartphone, maupun tablet).
+- **Dual RFID Reader Hardware SPI**:
+  - **RFID 1 (Pendaftaran Member)**: Membaca kartu RFID di loket pendaftaran, otomatis mengisi input UID form registrasi (mendukung 4-byte, 7-byte, dan 10-byte UID).
+  - **RFID 2 (Gerbang Akses Wahana)**: Memvalidasi kelayakan pengunjung saat men-tap kartu di wahana permainan.
+- **Validasi Akses Wahana (*Ride Validator*)**: Sistem mencocokkan tinggi badan pengunjung dengan katalog wahana (*Roller Coaster Halilintar*, *Kora-Kora*, *Bianglala*, *Arena Bumper Car Anak*) dan membunyikan buzzer ESP32 secara interaktif via pesan MQTT Command.
+- **Arsitektur Local-First & Supabase**: Dashboard beroperasi 100% secara offline via `localStorage`, dan secara otomatis menyinkronkan data member dan log validasi ke Supabase PostgreSQL saat terhubung ke internet.
 
-Upload ke ESP32 Dev Module. Firmware mengirim data JSON satu baris per pengukuran pada baud 115200. Contoh:
+---
 
-```json
-{"type":"measurement","device":"smartheight-esp32","sequence":12,"status":"ok","distanceCm":45.20,"heightCm":174.80,"referenceHeightCm":220.00,"offsetCm":0.00,"validSamples":5,"buzzerAlarm":false,"calibrated":false,"uptimeMs":15320}
-```
+## 🔌 Rangkaian Pin ESP32 (Wokwi & Hardware)
 
-Contoh itu hanya format protokol, bukan hasil pengujian fisik.
+| Komponen | Pin Modul | Pin ESP32 | Keterangan Sirkuit |
+|---|---|---|---|
+| **RFID Reader 1**<br>*(Pendaftaran)* | SCK | GPIO 18 | Bus VSPI Hardware |
+| | MISO | GPIO 19 | Bus VSPI Hardware |
+| | MOSI | GPIO 23 | Bus VSPI Hardware |
+| | SDA / SS | GPIO 5 | Chip Select RFID 1 |
+| | RST | GPIO 22 | Hardware Reset RFID 1 |
+| | 3.3V & GND | 3V3 & GND | Sumber daya 3.3V & Ground |
+| **RFID Reader 2**<br>*(Akses Wahana)* | SCK | GPIO 14 | Bus HSPI Hardware |
+| | MISO | GPIO 32 | Bus HSPI (*remapped* dari GPIO 12 untuk mencegah gagal boot) |
+| | MOSI | GPIO 13 | Bus HSPI Hardware |
+| | SDA / SS | GPIO 4 | Chip Select RFID 2 |
+| | RST | GPIO 21 | Hardware Reset RFID 2 |
+| | 3.3V & GND | 3V3 & GND | Sumber daya 3.3V & Ground |
+| **HC-SR04**<br>*(Ultrasonik)* | VCC | 5V / VIN | Sumber daya 5V |
+| | TRIG | GPIO 25 | Output trigger pulsa 10 µs |
+| | ECHO | GPIO 26 | Input echo melalui pembagi tegangan (R1=1kΩ seri, R2=2kΩ ke GND) |
+| | GND | GND | Ground |
+| **Buzzer Pasif** | SIGNAL / (+) | GPIO 27 | Output frekuensi PWM (2.000 Hz) |
+| | GND / (-) | GND | Ground |
 
-## Menjalankan website di Windows
+---
 
-Ekstrak folder proyek, buka PowerShell pada folder `COCOMANG-Live`, lalu jalankan:
+## 📡 Protokol Komunikasi MQTT
 
+Sistem menggunakan broker publik HiveMQ dengan topik MQTT terstruktur:
+
+| Arah | Topik MQTT | Format Payload | Deskripsi |
+|---|---|---|---|
+| **ESP32 -> Web** | `cocomang/smartheight/telemetry` | JSON | Telemetri jarak sensor dan estimasi tinggi badan setiap 500 ms |
+| **ESP32 -> Web** | `cocomang/smartheight/rfid` | Plaintext | Event deteksi kartu pada Reader 1 atau Reader 2 |
+| **Web -> ESP32** | `cocomang/smartheight/command` | Karakter ASCII | Perintah kendali buzzer dan pemicu diagnostik |
+
+### Contoh Payload:
+1. **Telemetri Pengukuran (`cocomang/smartheight/telemetry`)**:
+   ```json
+   {"type":"measurement","device":"smartheight-esp32","sequence":28,"status":"ok","distanceCm":52.4,"heightCm":167.6,"referenceHeightCm":220.0,"validSamples":1,"uptimeMs":14500}
+   ```
+2. **Event RFID Reader 1 (`cocomang/smartheight/rfid`)**:
+   ```text
+   [RFID 1 - PENDAFTARAN] Kartu Terdeteksi! UID: 04:A1:B2:C3:D4
+   ```
+3. **Event RFID Reader 2 (`cocomang/smartheight/rfid`)**:
+   ```text
+   [RFID 2 - AKSES WAHANA] Kartu Terdeteksi! UID: 04:A1:B2:C3:D4
+   ```
+4. **Perintah Command (`cocomang/smartheight/command`)**:
+   - `'b'`: Membunyikan 1 bip pendek (200 ms) saat akses wahana disetujui.
+   - `'n'`: Membunyikan 3 bip peringatan (100 ms on/off) saat akses wahana ditolak.
+   - `'u'`: Memaksa sensor HC-SR04 membaca jarak dan mempublikasikan telemetri seketika.
+   - `'r'`: Memeriksa status chip RFID pada serial monitor Wokwi.
+
+---
+
+## 🗄️ Konfigurasi Database Supabase Cloud
+
+1. **Deploy Skema SQL**:
+   Salin dan jalankan seluruh isi file [`supabase/schema.sql`](./supabase/schema.sql) pada **SQL Editor** Supabase.
+   Skrip ini secara otomatis membuat:
+   - Tabel `members`: UID kartu RFID, nama, usia, jenis kelamin, berat, dan tinggi badan.
+   - Tabel `rides`: Katalog wahana permainan beserta batasan tinggi minimum & maksimum.
+   - Tabel `ride_validations`: Log akses pengunjung ke gerbang wahana permainan.
+   - Hak akses Row Level Security (RLS) anon publik & publikasi Realtime WebSocket.
+2. **Konfigurasi Kredensial via `.env`**:
+   Salin template ke `dist/.env`:
+   ```powershell
+   Copy-Item dist/.env.example dist/.env
+   ```
+   Buka file `dist/.env` lalu isi:
+   ```env
+   SUPABASE_URL=https://your-project-id.supabase.co
+   SUPABASE_ANON_KEY=your-anon-public-key-here
+   ```
+*(Detail selengkapnya tersedia pada [`docs/PANDUAN-SUPABASE.md`](./docs/PANDUAN-SUPABASE.md)).*
+
+---
+
+## 🚀 Cara Menjalankan Sistem
+
+### Langkah 1: Jalankan Simulasi Wokwi
+1. Buka [https://wokwi.com/projects/new/esp32](https://wokwi.com/projects/new/esp32) (atau gunakan ekstensi Wokwi di VS Code).
+2. Salin isi [`firmware/smartheight_wokwi/diagram.json`](./firmware/smartheight_wokwi/diagram.json) ke tab **diagram.json** Wokwi.
+3. Salin kode [`firmware/smartheight_wokwi/smartheight_wokwi.ino`](./firmware/smartheight_wokwi/smartheight_wokwi.ino) ke tab sketch.
+4. Pada tab **Library Manager** Wokwi, tambahkan library `PubSubClient`.
+5. Klik **Play/Start Simulation**.
+
+### Langkah 2: Jalankan Web Dashboard
+Buka terminal di folder `cocomang`:
 ```powershell
 py -m http.server 8000 --directory dist
 ```
+Buka peramban pada URL:
+```text
+http://localhost:8000
+```
+Klik tombol **"Hubungkan Wokwi"** di bagian atas dashboard. Status koneksi akan langsung berubah menjadi **`🟢 Wokwi Terhubung`**.
 
-Buka `http://localhost:8000` menggunakan Chrome atau Edge desktop. Jangan membuka `index.html` melalui `file://`. Web Serial tersedia pada secure context seperti `localhost` dan HTTPS.
+### Langkah 3: Alur Uji Coba:
+- **Pendaftaran Member**: Klik modul RFID 1 di simulator Wokwi lalu dekatkan kartu virtual. Modal pendaftaran member di dashboard akan otomatis terbuka dengan UID terisi. Masukkan nama dan simpan.
+- **Pengukuran Tinggi**: Geser slider jarak pada modul sensor HC-SR04 di Wokwi. Nilai tinggi badan akan terupdate secara real-time di tab **Pengukuran Live**. Klik simpan untuk mencatat ke profil member.
+- **Validasi Akses Wahana**: Buka tab **Member**, pilih wahana (misal: *Roller Coaster Halilintar* min 140 cm), lalu dekatkan kartu ke modul RFID 2 di Wokwi. Dashboard akan menampilkan hasil verifikasi kelayakan (Lolos/Ditolak) dan memicu buzzer ESP32.
 
-## Menghubungkan ESP32
+---
 
-1. Pastikan firmware `smartheight_progres2_dual_rfid.ino` sudah diunggah.
-2. Sebelum upload firmware, putuskan koneksi website melalui tombol **Putuskan**. Sebelum menghubungkan website, tutup Serial Monitor Arduino IDE. Port COM biasanya hanya dapat dibuka oleh satu aplikasi pada satu waktu.
-3. Buka menu **Pengukuran live** pada COCOMANG.
-4. Klik **Hubungkan ESP32**.
-5. Pilih COM port ESP32 pada dialog browser dan izinkan akses.
-6. Dashboard harus menunjukkan **Data live diterima** serta nilai jarak dan tinggi.
-7. Untuk pengukuran tinggi, tambahkan pengunjung secara manual pada menu Pengunjung, pilih namanya, lalu klik **Simpan hasil live**.
-8. Nama, usia, jenis kelamin, dan berat badan adalah data manual/opsional. Tinggi badan hanya berasal dari pembacaan sensor, bukan input operator.
-Jika browser tidak menawarkan daftar COM, cek kabel USB data, driver USB-serial, dan apakah Serial Monitor atau aplikasi lain masih menggunakan port tersebut.
+## 🧪 Pengujian Otomatis (*Automated Unit Testing*)
 
-## Riwayat dan PDF
-
-- Riwayat pengunjung hanya bertambah saat petugas menekan **Simpan hasil live** pada mode pengukuran tinggi.
-- Data disimpan pada `localStorage` browser di perangkat tersebut. Tidak ada cloud sync atau Firebase pada tahap ini.
-- CSV dapat diunduh langsung.
-- Tombol **Cetak / Simpan PDF** membuka halaman laporan. Pada dialog cetak Chrome/Edge pilih printer **Save as PDF / Simpan sebagai PDF**.
-- Gunakan rentang tanggal, pencarian nama, status buzzer, dan status kalibrasi untuk membatasi isi laporan. CSV dan PDF mengikuti filter yang sedang aktif.
-
-## Pemeriksaan cepat
+Proyek ini dilengkapi dengan 29 automated unit test:
 
 ```powershell
 npm test
+```
+
+Verifikasi sintaks modul ES:
+```powershell
 npm run check
 ```
 
-Tes Node memvalidasi model data, repository localStorage, dan parser protokol serial ESP32. Saat ini 10 test lulus. Pengujian browser dan perangkat fisik dijelaskan di `QA.md`.
+Cakupan pengujian (29 tests passing):
+- **Wokwi MQTT Transport**: Verifikasi konfigurasi broker, parser telemetri, dan event deteksi RFID (`tests/wokwi-transport.test.mjs` — 5 tests)
+- **Model Data Member & Storage**: Format UID RFID, validasi nama/gender/berat, pencegahan duplikasi UID, dan penghapusan member (`tests/data.test.mjs` — 7 tests)
+- **Ride Access Validator**: Logika batas kelayakan tinggi min/max wahana dan kalkulasi selisih (`tests/ride-validation.test.mjs` — 6 tests)
+- **Serial Protocol Parser**: Validasi frame JSON telemetri dan log serial regular expression (`tests/serial-protocol.test.mjs` — 4 tests)
+- **Supabase Mapper**: Pemetaan dua arah model camelCase <-> snake_case PostgreSQL (`tests/supabase-mapper.test.mjs` — 2 tests)
 
-## Batasan dan status verifikasi
+---
 
-- Tes otomatis memvalidasi model data, parser JSON, visualisasi, dan logika perangkat lunak; tes ini bukan pengujian sensor fisik.
-- Koneksi USB Serial membutuhkan browser Chromium desktop yang mendukung Web Serial API.
-- Website tidak dapat membaca COM port dari Safari/Firefox atau halaman `file://`.
-- Firmware dan website harus memakai protokol JSON dan baud rate 115200 yang sama.
-- Hasil tinggi tetap berupa estimasi prototipe. Validasi reference height, offset, posisi sensor, dan perbandingan dengan alat ukur perlu dilakukan secara fisik sebelum menyimpulkan akurasi.
-- Buzzer dikendalikan firmware. Dashboard hanya menampilkan status ambang yang dikirim ESP32.
+## 📚 Dokumen Terkait
+
+- [`firmware/smartheight_wokwi/README.md`](./firmware/smartheight_wokwi/README.md) — Panduan cepat simulasi Wokwi nirkabel.
+- [`docs/PANDUAN-SUPABASE.md`](./docs/PANDUAN-SUPABASE.md) — Panduan konfigurasi Supabase PostgreSQL & Realtime.
+- [`docs/PANDUAN-PENGUJIAN-LIVE.md`](./docs/PANDUAN-PENGUJIAN-LIVE.md) — Prosedur operasional kalibrasi sensor fisik.
+- [`DESIGN.md`](./DESIGN.md) & [`QA.md`](./QA.md) — Spesifikasi teknis & checklist jaminan kualitas.
