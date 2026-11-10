@@ -75,6 +75,34 @@ ALTER PUBLICATION supabase_realtime ADD TABLE members;
 ALTER PUBLICATION supabase_realtime ADD TABLE rides;
 ALTER PUBLICATION supabase_realtime ADD TABLE ride_validations;
 
+-- 4. Tabel Transaksi Tiket Wahana (Kiosk Loket Mandiri)
+CREATE TABLE IF NOT EXISTS ride_tickets (
+  id TEXT PRIMARY KEY,                           -- Format: 'TCK-TIMESTAMP-RAND'
+  rfid_uid VARCHAR(32) NOT NULL REFERENCES members(rfid_uid) ON DELETE CASCADE,
+  member_name VARCHAR(100) NOT NULL,
+  member_height_cm NUMERIC(5,2) NOT NULL,
+  ride_id VARCHAR(50) NOT NULL REFERENCES rides(id) ON DELETE RESTRICT,
+  ride_name VARCHAR(100) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'ISSUED'   -- 'ISSUED', 'USED', 'CANCELLED'
+    CHECK (status IN ('ISSUED', 'USED', 'CANCELLED')),
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  used_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_tickets_rfid ON ride_tickets(rfid_uid);
+CREATE INDEX IF NOT EXISTS idx_tickets_ride ON ride_tickets(ride_id);
+CREATE INDEX IF NOT EXISTS idx_tickets_status ON ride_tickets(status);
+CREATE INDEX IF NOT EXISTS idx_tickets_issued ON ride_tickets(issued_at DESC);
+
+ALTER TABLE ride_tickets ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow public all on ride_tickets" 
+  ON ride_tickets FOR ALL 
+  USING (true) 
+  WITH CHECK (true);
+
+ALTER PUBLICATION supabase_realtime ADD TABLE ride_tickets;
+
 -- Data Awal Katalog Wahana Populer
 INSERT INTO rides (id, name, min_height_cm, max_height_cm, description) VALUES
   ('roller-coaster', 'Roller Coaster Halilintar', 140.0, NULL, 'Wahana kecepatan tinggi dengan lintasan loop ekstrem 360 derajat.'),
