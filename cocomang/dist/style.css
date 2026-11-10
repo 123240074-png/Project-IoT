@@ -476,6 +476,38 @@ main {
   background: transparent;
 }
 
+button.pill {
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: inherit;
+  text-decoration: none;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+button.pill:hover {
+  filter: brightness(0.96);
+  border-color: var(--ink);
+}
+
+button.pill.offline:hover {
+  background: var(--surface);
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
+.nav-link.nav-link-wahana {
+  margin-left: auto;
+  color: var(--green);
+  font-weight: 600;
+}
+
+.nav-link.nav-link-wahana:hover {
+  color: var(--green-deep);
+  border-bottom-color: var(--green);
+}
+
 .status {
   display: inline-flex;
   align-items: center;
@@ -1569,6 +1601,14 @@ dialog::backdrop { background: rgba(23, 54, 42, 0.5); }
   .summary-cell:last-child { border-bottom: 0; }
 
   .brand-caption { display: none; }
+
+  .nav-link.nav-link-wahana {
+    grid-column: 1 / -1;
+    margin-left: 0;
+    min-height: 38px;
+    border-top: 1px dashed var(--line);
+    background: var(--green-soft);
+  }
 
   .nav-list {
     display: grid;

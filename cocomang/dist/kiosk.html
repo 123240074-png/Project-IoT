@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f1e8">
+  <meta name="description" content="COCOMANG SmartHeight Loket Wahana: Pilih wahana terlebih dahulu lalu tap kartu NFC/RFID di Reader 2.">
+  <meta name="color-scheme" content="light">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23254b3e'/%3E%3Cpath d='M8 9h16M8 15h10M8 21h16' stroke='%23f4f1e8' stroke-width='2.4'/%3E%3C/svg%3E">
+  <title>Loket Wahana | COCOMANG</title>
+  <link rel="stylesheet" href="./style.css">
+  <style>
+    /* Styling khusus alur Kiosk COCOMANG sesuai DESIGN.md */
+    .kiosk-shell {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 24px 32px 48px;
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+      min-height: calc(100vh - 180px);
+    }
+
+    .kiosk-step-indicator {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      padding: 12px 20px;
+      font-size: 13px;
+    }
+
+    .step-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: var(--green);
+      color: var(--panel-ink);
+      font-weight: 700;
+      font-size: 12px;
+    }
+
+    .step-badge.inactive {
+      background: var(--line);
+      color: var(--muted);
+    }
+
+    /* Step 1: Rides Catalog */
+    .catalog-header {
+      margin-bottom: 8px;
+    }
+
+    .catalog-header h1 {
+      font-family: var(--font-display);
+      font-size: 26px;
+      color: var(--ink);
+      margin-bottom: 4px;
+    }
+
+    .catalog-header p {
+      color: var(--muted);
+      font-size: 13.5px;
+    }
+
+    .rides-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 18px;
+    }
+
+    .ride-card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
+      cursor: pointer;
+    }
+
+    .ride-card:hover {
+      border-color: #8a9a85;
+      box-shadow: 0 4px 14px rgba(37, 75, 62, 0.08);
+      transform: translateY(-2px);
+    }
+
+    .ride-card-title {
+      font-family: var(--font-display);
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 6px;
+    }
+
+    .ride-card-limits {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      padding: 3px 8px;
+      border-radius: 2px;
+      background: var(--green-soft);
+      color: var(--green-deep);
+      border: 1px solid #9eb79d;
+      margin-bottom: 12px;
+      font-weight: 600;
+    }
+
+    .ride-card-desc {
+      font-size: 12.5px;
+      color: var(--muted);
+      line-height: 1.5;
+      margin-bottom: 18px;
+      min-height: 40px;
+    }
+
+    /* Step 2: NFC / RFID Reader Standby Card */
+    .standby-card {
+      background: var(--surface);
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      padding: 48px 32px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 16px rgba(36, 60, 50, 0.04);
+      margin: auto 0;
+    }
+
+    .standby-badge {
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: var(--green-soft);
+      border: 2px solid var(--line-strong);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+      color: var(--green);
+      animation: pulse-ring 2s infinite cubic-bezier(0.4, 0, 0.6, 1);
+    }
+
+    @keyframes pulse-ring {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.06); }
+    }
+
+    .standby-badge svg {
+      width: 40px;
+      height: 40px;
+    }
+
+    .selected-ride-banner {
+      background: #f7f9f3;
+      border: 1px solid #cbd8c5;
+      border-radius: var(--radius);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      width: 100%;
+      max-width: 680px;
+      margin-bottom: 24px;
+      text-align: left;
+    }
+
+    .sim-panel {
+      margin-top: 18px;
+      padding: 12px 18px;
+      background: var(--surface-muted);
+      border: 1px dashed var(--line-strong);
+      border-radius: var(--radius);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 12px;
+    }
+
+    .sim-panel input {
+      padding: 6px 12px;
+      border: 1px solid var(--line-strong);
+      background: #fff;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border-radius: var(--radius);
+      width: 170px;
+      text-align: center;
+    }
+
+    /* Modal / Ticket Receipts */
+    .ticket-paper {
+      background: var(--surface);
+      border: 2px dashed var(--line-strong);
+      border-radius: var(--radius);
+      padding: 24px;
+      text-align: center;
+      margin: 16px 0;
+    }
+
+    .ticket-code {
+      font-family: var(--font-mono);
+      font-size: 18px;
+      font-weight: bold;
+      letter-spacing: 0.12em;
+      color: var(--green-deep);
+      padding: 8px 14px;
+      background: var(--green-soft);
+      border: 1px solid #9eb79d;
+      border-radius: 2px;
+      display: inline-block;
+      margin: 10px 0;
+    }
+
+    .ticket-table {
+      width: 100%;
+      text-align: left;
+      font-size: 12.5px;
+      margin-top: 14px;
+      border-collapse: collapse;
+    }
+
+    .ticket-table td {
+      padding: 6px 4px;
+      border-bottom: 1px dotted var(--line);
+    }
+
+    .ticket-table td:first-child {
+      color: var(--muted);
+      width: 38%;
+    }
+
+    .ticket-table td:last-child {
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    .countdown-pill {
+      font-family: var(--font-mono);
+      font-weight: 700;
+      color: var(--accent-ink);
+      background: var(--accent);
+      padding: 2px 8px;
+      border-radius: 2px;
+      font-size: 12px;
+    }
+
+    .rejection-box {
+      background: #fdf2f1;
+      border: 1px solid #eed0cc;
+      border-left: 4px solid var(--red);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin: 16px 0;
+      text-align: left;
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="app-shell">
+    
+    <!-- Header Masthead: 100% Identik dengan Pos Pendaftaran -->
+    <header class="masthead">
+      <div class="masthead-inner">
+        <a class="brand" href="./kiosk.html">
+          <span class="brand-name">COCOMANG</span>
+          <span class="brand-caption">Smart Height Measurement System</span>
+        </a>
+        <div class="desk-identity">
+          <span>Loket & Akses Wahana</span>
+          <strong>Kiosk Mandiri (RFID 2)</strong>
+        </div>
+        <div class="operator">
+          <span class="mode-label">Serial 115200</span>
+          <button class="pill offline" id="serialStatusPill" style="cursor: pointer; border: 1px solid var(--line);" title="Klik untuk hubungkan / putuskan USB Serial ESP32 (115200 baud)">
+            <i></i><span>ESP32 terputus</span>
+          </button>
+          <span class="cloud-pill connected" id="cloudPill" title="Status Database Supabase"><i></i>Kiosk Mandiri</span>
+        </div>
+      </div>
+      <nav class="nav-list" aria-label="Navigasi utama">
+        <a class="nav-link active" href="./kiosk.html" aria-current="page">
+          <span class="nav-number">01</span><span>Loket Kiosk Wahana</span>
+        </a>
+        <a class="nav-link" href="./index.html" style="margin-left: auto; color: var(--green); font-weight: 600;">
+          <span>← Kembali ke Pos Pendaftaran (RFID 1)</span>
+        </a>
+      </nav>
+    </header>
+
+    <!-- Workspace & Topbar: Identik dengan Pos Pendaftaran -->
+    <div class="workspace">
+      <div class="topbar">
+        <span class="breadcrumb" id="kioskBreadcrumb">Pos Loket <span>/</span> <strong>Langkah 1: Pilih Wahana Permainan</strong></span>
+        <div style="display: flex; align-items: center; gap: 16px;">
+          <!-- Sesi Countdown (Muncul saat memilih kartu) -->
+          <div id="sessionWrapper" style="display: none; align-items: center; gap: 8px; font-size: 12px; color: var(--muted);">
+            <span>Batas waktu tap:</span>
+            <span id="sessionCountdown" class="countdown-pill">30s</span>
+            <button id="btnCancelStep2" class="btn" style="padding: 2px 8px; min-height: 24px; font-size: 11px;">Ganti Wahana</button>
+          </div>
+          <span class="date-label" id="liveDateLabel">Senin, 10 November 2026</span>
+        </div>
+      </div>
+
+      <!-- Main Kiosk Body -->
+      <main class="kiosk-shell" id="main" tabindex="-1">
+
+        <!-- Indicator Alur Kiosk -->
+        <div class="kiosk-step-indicator">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="stepBadge1" class="step-badge">1</span>
+            <strong id="stepLabel1">Pilih Wahana</strong>
+          </div>
+          <span style="color: var(--line-strong);">→</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="stepBadge2" class="step-badge inactive">2</span>
+            <span id="stepLabel2" style="color: var(--muted);">Tap Kartu NFC/RFID (Reader 2)</span>
+          </div>
+          <span style="color: var(--line-strong);">→</span>
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="stepBadge3" class="step-badge inactive">3</span>
+            <span id="stepLabel3" style="color: var(--muted);">Verifikasi & Penerbitan Tiket</span>
+          </div>
+        </div>
+
+        <!-- TAHAP 1: KATALOG PEMILIHAN WAHANA (TAMPIL DIAWAL) -->
+        <section id="step1Catalog">
+          <div class="catalog-header">
+            <h1>Pilih Wahana Permainan</h1>
+            <p>Silakan klik atau pilih wahana yang ingin Anda naiki terlebih dahulu sebelum menempelkan kartu.</p>
+          </div>
+
+          <div id="ridesGrid" class="rides-grid">
+            <!-- Rendered by JavaScript -->
+          </div>
+        </section>
+
+        <!-- TAHAP 2: STANDBY TAP KARTU NFC/RFID (SETELAH WAHANA DIPILIH) -->
+        <section id="step2Tap" class="standby-card" style="display: none;" aria-live="polite">
+          
+          <!-- Banner Wahana Terpilih -->
+          <div class="selected-ride-banner">
+            <div>
+              <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted);">Wahana Terpilih:</div>
+              <h2 id="dispSelectedRideName" style="font-family: var(--font-display); font-size: 20px; color: var(--ink); margin: 2px 0;">Roller Coaster Halilintar</h2>
+              <div id="dispSelectedRideLimits" class="ride-card-limits" style="margin-bottom: 0;">Syarat: Min 140 cm</div>
+            </div>
+            <button id="btnChangeRide" class="btn" style="font-size: 12px; padding: 6px 12px;">← Ganti Wahana</button>
+          </div>
+
+          <div class="standby-badge">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <line x1="7" y1="8" x2="17" y2="8" />
+              <line x1="7" y1="12" x2="11" y2="12" />
+              <line x1="7" y1="16" x2="14" y2="16" />
+            </svg>
+          </div>
+
+          <h1 style="font-family: var(--font-display); font-size: 26px; color: var(--ink); margin-bottom: 8px;">
+            Tempelkan Kartu NFC / RFID Anda
+          </h1>
+          <p style="color: var(--muted); max-width: 560px; font-size: 14px; line-height: 1.6; margin-bottom: 18px;">
+            Silakan dekatkan kartu pada sensor <strong>Reader 2 (Akses Masuk Wahana)</strong>. Buzzer ESP32 akan berbunyi 1x bip jika lolos syarat, atau 3x bip jika tidak memenuhi syarat wahana.
+          </p>
+
+          <!-- Status Koneksi Serial Info -->
+          <div id="serialNoticeBox" style="margin-bottom: 16px; font-size: 12px; color: var(--muted); background: var(--surface-muted); padding: 8px 16px; border: 1px solid var(--line); border-radius: var(--radius); max-width: 560px;">
+            <span id="serialNoticeText">ESP32 belum terhubung. Klik status <strong>ESP32 terputus</strong> di header untuk menghubungkan Web Serial 115200.</span>
+          </div>
+
+          <!-- Input Tersembunyi untuk Keyboard-Wedge Scanner -->
+          <input type="text" id="rfidBufferInput" autocomplete="off" style="position: absolute; opacity: 0; pointer-events: none;" />
+
+          <!-- Simulasi Manual untuk Pengujian Langsung -->
+          <div class="sim-panel">
+            <span style="font-weight: 600; color: var(--ink);">Simulasi Tap Reader 2:</span>
+            <input type="text" id="manualRfidInput" placeholder="04:A1:B2:C3" maxlength="20" />
+            <button id="btnManualScan" class="btn green" style="padding: 6px 14px; font-size: 12px;">Tap RFID 2</button>
+          </div>
+          <span style="font-size: 11px; color: var(--muted); margin-top: 8px;">*Sensor fisik hanya menerima kartu dari RFID 2. Tap dari RFID 1 (Pos Pendaftaran) akan otomatis diabaikan.</span>
+        </section>
+      </main>
+
+      <!-- Footer Identik dengan Pos Pendaftaran -->
+      <footer class="workspace-footer">
+        <div>
+          <strong>COCOMANG</strong>
+          <span>Smart Height Measurement System • Alur Loket: Pilih Wahana → Tap Kartu RFID 2.</span>
+        </div>
+        <span style="font-size: 11.5px; color: var(--muted);">Buzzer Hardware Only • Serial 115200 baud</span>
+      </footer>
+    </div>
+  </div>
+
+  <!-- DIALOG 1: Tiket Akses Diterbitkan (Lolos Syarat - Buzzer 1x Bip) -->
+  <dialog id="ticketDialog" aria-labelledby="dialogTitleSuccess">
+    <div style="padding: 24px; background: var(--paper);">
+      <div class="modal-head">
+        <div>
+          <h2 id="dialogTitleSuccess" style="font-family: var(--font-display); font-size: 20px; color: var(--green-deep); margin: 0;">✓ Akses Wahana Disetujui!</h2>
+          <p style="font-size: 12px; color: var(--muted); margin-top: 3px;">Tinggi badan Anda memenuhi batas aman wahana permainan.</p>
+        </div>
+      </div>
+
+      <div class="ticket-paper">
+        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);">Karcis Masuk Digital</div>
+        <div id="modalTicketCode" class="ticket-code">TCK-000000</div>
+        
+        <table class="ticket-table">
+          <tr>
+            <td>Wahana</td>
+            <td id="modalRideName">Roller Coaster</td>
+          </tr>
+          <tr>
+            <td>Pengunjung</td>
+            <td id="modalGuestName">Budi Santoso</td>
+          </tr>
+          <tr>
+            <td>Tinggi Badan</td>
+            <td id="modalGuestHeight">145 cm</td>
+          </tr>
+          <tr>
+            <td>Status Pintu</td>
+            <td style="color: var(--green); font-weight: bold;">SILAKAN MASUK WAHANA</td>
+          </tr>
+        </table>
+      </div>
+
+      <div style="display: flex; gap: 10px; margin-top: 18px;">
+        <button id="btnCloseDialog" class="btn primary full">Selesai & Pilih Wahana Lain (Reset)</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- DIALOG 2: Akses Ditolak (Tidak Memenuhi Syarat - Buzzer 3x Bip) -->
+  <dialog id="rejectDialog" aria-labelledby="dialogTitleReject">
+    <div style="padding: 24px; background: var(--paper);">
+      <div class="modal-head">
+        <div>
+          <h2 id="dialogTitleReject" style="font-family: var(--font-display); font-size: 20px; color: var(--red); margin: 0;">✕ Akses Wahana Ditolak</h2>
+          <p style="font-size: 12px; color: var(--muted); margin-top: 3px;">Tinggi badan Anda belum memenuhi kriteria keselamatan wahana ini.</p>
+        </div>
+      </div>
+
+      <div class="rejection-box">
+        <strong id="rejectMemberName" style="display: block; font-size: 14px; color: var(--ink); margin-bottom: 4px;">Nama Pengunjung</strong>
+        <p id="rejectReasonText" style="font-size: 12.5px; color: #7b2924; line-height: 1.5; margin: 0;">
+          Tinggi badan kurang dari syarat minimum wahana.
+        </p>
+      </div>
+
+      <div style="background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px; font-size: 12px; margin-bottom: 18px;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+          <span style="color: var(--muted);">Wahana yang Dipilih:</span>
+          <strong id="rejectRideName">-</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+          <span style="color: var(--muted);">Tinggi Terukur Pos Pendaftaran:</span>
+          <strong id="rejectMemberHeight">-</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+          <span style="color: var(--muted);">Batas Aman Wahana:</span>
+          <strong id="rejectRideLimits">-</strong>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 10px;">
+        <button id="btnTryAnotherRide" class="btn primary full">Pilih Wahana Lain</button>
+        <button id="btnCloseRejectDialog" class="btn">Tutup</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Toast Notification -->
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <!-- Script Logika Alur Loket & Serial 115200 -->
+  <script type="module">
+    import { lookupMember, getActiveRides, evaluateRideEligibility, bookRideTicket, recordValidationAttempt } from './kiosk-service.mjs';
+    import { parseRfidLine } from './serial-protocol.mjs';
+
+    // State Aplikasi Kiosk
+    let availableRides = [];
+    let selectedRide = null;
+    let countdownInterval = null;
+    let countdownSec = 30;
+    let serialSession = null;
+
+    const toastEl = document.getElementById('toast');
+    function showToast(message, isError = false) {
+      toastEl.textContent = message;
+      toastEl.className = `show ${isError ? 'error' : ''}`;
+      setTimeout(() => { toastEl.className = ''; }, 3800);
+    }
+
+    // Tanggal Realtime Topbar
+    document.getElementById('liveDateLabel').textContent = new Date().toLocaleDateString('id-ID', {
+      weekday: 'long',
+      day: 'numeric',
+      month: 'long',
+      year: 'numeric',
+      timeZone: 'Asia/Jakarta',
+    });
+
+    // =========================================================================
+    // FITUR PAIR / KONEKSI WEB SERIAL 115200 BAUD (ESP32)
+    // =========================================================================
+    const serialStatusPill = document.getElementById('serialStatusPill');
+    const serialNoticeText = document.getElementById('serialNoticeText');
+
+    function updateSerialUI() {
+      if (serialSession) {
+        serialStatusPill.className = 'pill online';
+        serialStatusPill.innerHTML = '<i></i><span>Serial 115200 Terhubung</span>';
+        serialNoticeText.innerHTML = 'ESP32 terhubung (115200 baud). <strong>Reader 2 (Akses Wahana)</strong> siap membaca tap kartu.';
+      } else {
+        serialStatusPill.className = 'pill offline';
+        serialStatusPill.innerHTML = '<i></i><span>ESP32 terputus</span>';
+        serialNoticeText.innerHTML = 'ESP32 belum terhubung. Klik status <strong>ESP32 terputus</strong> di header untuk menghubungkan Web Serial 115200.';
+      }
+    }
+
+    // Perintah audio HANYA dikirimkan ke hardware buzzer ESP32 ('b' = 1 bip, 'n' = 3 bip)
+    async function sendBuzzerCommand(char) {
+      if (!serialSession?.port?.writable) return;
+      try {
+        const writer = serialSession.port.writable.getWriter();
+        const encoder = new TextEncoder();
+        await writer.write(encoder.encode(char));
+        writer.releaseLock();
+      } catch (err) {
+        console.warn('Gagal mengirim perintah buzzer ke ESP32:', err);
+      }
+    }
+
+    async function disconnectSerial() {
+      if (!serialSession) return;
+      serialSession.cancelled = true;
+      try {
+        if (serialSession.reader) {
+          await serialSession.reader.cancel();
+          serialSession.reader.releaseLock();
+        }
+        if (serialSession.port) {
+          await serialSession.port.close();
+        }
+      } catch (err) {
+        console.warn('Gagal menutup port serial dengan bersih:', err);
+      }
+      serialSession = null;
+      updateSerialUI();
+      showToast('Koneksi serial ke ESP32 diputuskan.');
+    }
+
+    async function connectSerial() {
+      if (!('serial' in navigator)) {
+        showToast('Web Serial API tidak didukung pada browser ini. Gunakan Google Chrome atau Microsoft Edge.', true);
+        return;
+      }
+      if (serialSession) {
+        await disconnectSerial();
+        return;
+      }
+
+      try {
+        const port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        const session = { port, reader: null, cancelled: false };
+        serialSession = session;
+        updateSerialUI();
+        showToast('ESP32 berhasil terhubung pada 115200 baud.');
+
+        const reader = port.readable.getReader();
+        session.reader = reader;
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (!session.cancelled) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let newlineIndex;
+          while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+            if (line) handleSerialLine(line);
+          }
+        }
+      } catch (err) {
+        console.error('Error koneksi serial:', err);
+        if (err.name !== 'NotFoundError') {
+          showToast(`Gagal membuka port serial: ${err.message}`, true);
+        }
+        await disconnectSerial();
+      }
+    }
+
+    serialStatusPill.addEventListener('click', connectSerial);
+
+    // =========================================================================
+    // BATASAN: WEBSITE LOKET WAHANA HANYA MEMPROSES RFID 2
+    // =========================================================================
+    function handleSerialLine(line) {
+      const rfidEvent = parseRfidLine(line);
+      if (rfidEvent?.uid) {
+        // Cek apakah berasal dari Reader 2
+        if (rfidEvent.reader !== 2) {
+          showToast(`[Abaikan Tap Reader ${rfidEvent.reader}] Loket Wahana hanya menerima tap dari RFID 2 (Akses Wahana). Tap kartu di Reader 2!`, true);
+          return;
+        }
+
+        // Jika belum memilih wahana, arahkan untuk memilih wahana dahulu
+        if (!selectedRide) {
+          showToast('Silakan pilih salah satu wahana terlebih dahulu sebelum menempelkan kartu!', true);
+          return;
+        }
+
+        showToast(`Kartu RFID 2 terdeteksi: ${rfidEvent.uid} (${rfidEvent.label})`);
+        processCardValidation(rfidEvent.uid);
+      }
+    }
+
+    // =========================================================================
+    // TAHAP 1: RENDER KATALOG & PEMILIHAN WAHANA
+    // =========================================================================
+    async function loadCatalog() {
+      availableRides = await getActiveRides();
+      const grid = document.getElementById('ridesGrid');
+      grid.innerHTML = '';
+
+      availableRides.forEach(ride => {
+        const card = document.createElement('div');
+        card.className = 'ride-card';
+        card.dataset.rideId = ride.id;
+
+        const limitText = `Min: ${ride.min_height_cm} cm${ride.max_height_cm ? ` / Maks: ${ride.max_height_cm} cm` : ''}`;
+
+        card.innerHTML = `
+          <div>
+            <div class="ride-card-title">${ride.name}</div>
+            <div class="ride-card-limits">${limitText}</div>
+            <div class="ride-card-desc">${ride.description || 'Wahana rekreasi seru dan aman.'}</div>
+          </div>
+          <div>
+            <button class="btn green full" style="pointer-events: none;">Pilih Wahana Ini →</button>
+          </div>
+        `;
+
+        card.addEventListener('click', () => {
+          selectRide(ride);
+        });
+
+        grid.appendChild(card);
+      });
+    }
+
+    function selectRide(ride) {
+      selectedRide = ride;
+
+      // Update Tampilan Banner Tahap 2
+      document.getElementById('dispSelectedRideName').textContent = ride.name;
+      document.getElementById('dispSelectedRideLimits').textContent = `Syarat Batas Tinggi: Min ${ride.min_height_cm} cm${ride.max_height_cm ? ` / Maks: ${ride.max_height_cm} cm` : ''}`;
+
+      // Ubah State Layar
+      document.getElementById('step1Catalog').style.display = 'none';
+      document.getElementById('step2Tap').style.display = 'flex';
+      document.getElementById('kioskBreadcrumb').innerHTML = `Pos Loket <span>/</span> <strong>Langkah 2: Tap Kartu untuk ${ride.name}</strong>`;
+
+      // Update Stepper
+      document.getElementById('stepBadge1').className = 'step-badge inactive';
+      document.getElementById('stepLabel1').style.color = 'var(--muted)';
+      document.getElementById('stepBadge2').className = 'step-badge';
+      document.getElementById('stepLabel2').style.color = 'var(--ink)';
+
+      startCountdown();
+      keepBufferFocus();
+    }
+
+    function returnToCatalog() {
+      clearInterval(countdownInterval);
+      selectedRide = null;
+
+      document.getElementById('step1Catalog').style.display = 'block';
+      document.getElementById('step2Tap').style.display = 'none';
+      document.getElementById('sessionWrapper').style.display = 'none';
+      document.getElementById('kioskBreadcrumb').innerHTML = `Pos Loket <span>/</span> <strong>Langkah 1: Pilih Wahana Permainan</strong>`;
+
+      // Reset Stepper
+      document.getElementById('stepBadge1').className = 'step-badge';
+      document.getElementById('stepLabel1').style.color = 'var(--ink)';
+      document.getElementById('stepBadge2').className = 'step-badge inactive';
+      document.getElementById('stepLabel2').style.color = 'var(--muted)';
+
+      document.getElementById('manualRfidInput').value = '';
+    }
+
+    document.getElementById('btnChangeRide').addEventListener('click', returnToCatalog);
+    document.getElementById('btnCancelStep2').addEventListener('click', returnToCatalog);
+    document.getElementById('btnTryAnotherRide').addEventListener('click', () => {
+      document.getElementById('rejectDialog').close();
+      returnToCatalog();
+    });
+
+    // Auto-Reset Timer Sesi di Tahap 2
+    function startCountdown() {
+      clearInterval(countdownInterval);
+      countdownSec = 30;
+      const el = document.getElementById('sessionCountdown');
+      el.textContent = `${countdownSec}s`;
+      document.getElementById('sessionWrapper').style.display = 'flex';
+
+      countdownInterval = setInterval(() => {
+        countdownSec -= 1;
+        el.textContent = `${countdownSec}s`;
+        if (countdownSec <= 0) returnToCatalog();
+      }, 1000);
+    }
+
+    // Focus Listener Keyboard Wedge
+    const rfidBufferInput = document.getElementById('rfidBufferInput');
+    const manualRfidInput = document.getElementById('manualRfidInput');
+    const btnManualScan = document.getElementById('btnManualScan');
+
+    const keepBufferFocus = () => {
+      if (selectedRide && document.activeElement !== manualRfidInput) {
+        rfidBufferInput.focus();
+      }
+    };
+    window.addEventListener('click', keepBufferFocus);
+    window.addEventListener('load', keepBufferFocus);
+
+    rfidBufferInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') {
+        const uid = rfidBufferInput.value.trim();
+        rfidBufferInput.value = '';
+        if (uid && selectedRide) await processCardValidation(uid);
+      }
+    });
+
+    btnManualScan.addEventListener('click', async () => {
+      const uid = manualRfidInput.value.trim();
+      if (uid && selectedRide) await processCardValidation(uid);
+    });
+    manualRfidInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter') {
+        const uid = manualRfidInput.value.trim();
+        if (uid && selectedRide) await processCardValidation(uid);
+      }
+    });
+
+    // =========================================================================
+    // TAHAP 2: PROSES VALIDASI KARTU PADA WAHANA TERPILIH
+    // =========================================================================
+    async function processCardValidation(rfidUid) {
+      if (!selectedRide) return;
+
+      try {
+        const member = await lookupMember(rfidUid);
+
+        // Kasus 1: Kartu belum terdaftar di pos pendaftaran
+        if (!member) {
+          await sendBuzzerCommand('n'); // Hardware buzzer ESP32 3x bip
+          showToast(`Kartu NFC/RFID [${rfidUid}] tidak ditemukan di data pendaftaran.`, true);
+
+          document.getElementById('rejectMemberName').textContent = `Kartu UID: ${rfidUid}`;
+          document.getElementById('rejectReasonText').textContent = 'Kartu belum terdaftar di Pos Pendaftaran. Silakan lakukan registrasi dan pengukuran tinggi badan terlebih dahulu.';
+          document.getElementById('rejectRideName').textContent = selectedRide.name;
+          document.getElementById('rejectMemberHeight').textContent = 'Belum terukur';
+          document.getElementById('rejectRideLimits').textContent = `Min: ${selectedRide.min_height_cm} cm${selectedRide.max_height_cm ? ` / Maks: ${selectedRide.max_height_cm} cm` : ''}`;
+
+          document.getElementById('rejectDialog').showModal();
+          return;
+        }
+
+        // Evaluasi kelayakan fisik (tinggi badan)
+        const evaluation = evaluateRideEligibility(member.height_cm, selectedRide);
+
+        // Kasus 2: Tidak memenuhi syarat wahana (Tinggi badan kurang/lebih)
+        if (!evaluation.eligible) {
+          await sendBuzzerCommand('n'); // Hardware buzzer ESP32 3x bip peringatan
+          await recordValidationAttempt({ member, ride: selectedRide, evaluation });
+
+          document.getElementById('rejectMemberName').textContent = `${member.name} (${member.rfid_uid})`;
+          document.getElementById('rejectReasonText').textContent = evaluation.reason;
+          document.getElementById('rejectRideName').textContent = selectedRide.name;
+          document.getElementById('rejectMemberHeight').textContent = `${member.height_cm || 0} cm`;
+          document.getElementById('rejectRideLimits').textContent = `Min: ${selectedRide.min_height_cm} cm${selectedRide.max_height_cm ? ` / Maks: ${selectedRide.max_height_cm} cm` : ''}`;
+
+          document.getElementById('rejectDialog').showModal();
+          return;
+        }
+
+        // Kasus 3: Memenuhi syarat wahana (Lolos)
+        await sendBuzzerCommand('b'); // Hardware buzzer ESP32 1x bip sukses
+        const ticket = await bookRideTicket({
+          member,
+          ride: selectedRide,
+          evaluation,
+        });
+
+        clearInterval(countdownInterval);
+
+        // Tampilkan Modal Tiket Masuk Berhasil
+        document.getElementById('modalTicketCode').textContent = ticket.id;
+        document.getElementById('modalRideName').textContent = ticket.ride_name;
+        document.getElementById('modalGuestName').textContent = ticket.member_name;
+        document.getElementById('modalGuestHeight').textContent = `${ticket.member_height_cm} cm`;
+
+        const ticketDialog = document.getElementById('ticketDialog');
+        ticketDialog.showModal();
+
+        // Reset otomatis ke katalog wahana setelah 10 detik
+        setTimeout(() => {
+          if (ticketDialog.open) {
+            ticketDialog.close();
+            returnToCatalog();
+          }
+        }, 10000);
+
+      } catch (err) {
+        console.error('Error saat validasi tiket:', err);
+        await sendBuzzerCommand('n');
+        showToast(`Gagal memproses validasi: ${err.message}`, true);
+      }
+    }
+
+    document.getElementById('btnCloseDialog').addEventListener('click', () => {
+      document.getElementById('ticketDialog').close();
+      returnToCatalog();
+    });
+
+    document.getElementById('btnCloseRejectDialog').addEventListener('click', () => {
+      document.getElementById('rejectDialog').close();
+    });
+
+    // Inisialisasi katalog saat halaman dimuat
+    loadCatalog();
+  </script>
+</body>
+</html>

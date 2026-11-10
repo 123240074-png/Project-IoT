@@ -5,6 +5,6 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check dist/app.mjs && node --check dist/data.mjs && node --check dist/serial-protocol.mjs && node --check dist/ride-validator.mjs && node --check dist/supabase-service.mjs"
+    "check": "node --check dist/app.mjs && node --check dist/data.mjs && node --check dist/serial-protocol.mjs && node --check dist/ride-validator.mjs && node --check dist/supabase-service.mjs && node --check dist/kiosk-service.mjs"
   }
 }

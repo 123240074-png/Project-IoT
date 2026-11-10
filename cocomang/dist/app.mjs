@@ -129,9 +129,9 @@ function isLive() {
 }
 
 function statusPill() {
-  if (!serialSession) return '<span class="pill offline"><i></i>ESP32 terputus</span>';
-  if (!isLive()) return '<span class="pill waiting"><i></i>Menunggu data</span>';
-  return '<span class="pill online"><i></i>Data live diterima</span>';
+  if (!serialSession) return '<button type="button" class="pill offline" data-action="toggle-serial" title="ESP32 terputus. Klik untuk menghubungkan ke serial ESP32 (115200 baud)"><i></i><span>ESP32 terputus</span></button>';
+  if (!isLive()) return '<button type="button" class="pill waiting" data-action="toggle-serial" title="ESP32 terhubung, menunggu data live. Klik untuk memutuskan koneksi serial"><i></i><span>Menunggu data</span></button>';
+  return '<button type="button" class="pill online" data-action="toggle-serial" title="Data live diterima. Klik untuk memutuskan koneksi serial"><i></i><span>Data live diterima</span></button>';
 }
 
 function cloudPill() {
@@ -458,7 +458,7 @@ function render() {
         <div class="desk-identity"><span>Pos Ukur & Wahana</span><strong>ESP32 Dual RFID</strong></div>
         <div class="operator"><span class="mode-label">Serial 115200</span>${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan koneksi perangkat">${svg('info')}</button></div>
       </div>
-      <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}</nav>
+      <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}<a class="nav-link nav-link-wahana" href="./kiosk.html" style="margin-left: auto; color: var(--green); font-weight: 600;" title="Kembali ke Pos Wahana (Kiosk Mandiri RFID 2)"><span>Kembali ke Pos Wahana</span></a></nav>
     </header>
     <div class="workspace"><div class="topbar"><span class="breadcrumb">Pos pengukuran <span>/</span> <strong>${current}</strong></span><span class="date-label">${new Date().toLocaleDateString('id-ID', { weekday:'long', day:'numeric', month:'long', year:'numeric', timeZone:'Asia/Jakarta' })}</span></div>
       <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : (route === 'member' || route === 'pengunjung') ? membersPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
@@ -474,7 +474,15 @@ function updateConnectionUI() {
   const stateText = !connected ? 'ESP32 terputus' : live ? 'Data live diterima' : 'Menunggu data';
   $$('.pill').forEach(element => {
     element.className = `pill ${!connected ? 'offline' : live ? 'online' : 'waiting'}`;
-    element.innerHTML = `<i></i>${stateText}`;
+    element.innerHTML = `<i></i><span>${stateText}</span>`;
+    element.title = !connected
+      ? 'ESP32 terputus. Klik untuk menghubungkan ke serial ESP32 (115200 baud)'
+      : live
+        ? 'Data live diterima. Klik untuk memutuskan koneksi serial'
+        : 'ESP32 terhubung, menunggu data. Klik untuk memutuskan koneksi serial';
+    if (element.tagName === 'BUTTON') {
+      element.dataset.action = 'toggle-serial';
+    }
   });
   const connect = $('#connect-device');
   const disconnect = $('#disconnect-device');
@@ -579,41 +587,32 @@ async function handleRideValidation(member, readerId = 2) {
 function processSerialLine(line) {
   const rfidEvent = parseRfidLine(line);
   if (rfidEvent) {
+    // Batasan: Pos Pendaftaran HANYA boleh memproses tap dari RFID 1 (Pendaftaran)
+    if (rfidEvent.reader !== 1) {
+      toast(`[Abaikan Tap Reader ${rfidEvent.reader}] Pos Pendaftaran hanya memproses RFID 1 (Pendaftaran). Silakan buka Loket Kiosk untuk memproses RFID 2.`, true);
+      return;
+    }
+
     lastScannedRfid = rfidEvent.uid;
     const rfidInput = document.getElementById('member-rfid');
     if (rfidInput) {
       rfidInput.value = rfidEvent.uid;
       rfidInput.focus();
-      toast(`Kartu RFID terdeteksi dari reader ${rfidEvent.reader} (${rfidEvent.label}): ${rfidEvent.uid}`);
+      toast(`Kartu RFID terdeteksi dari Reader 1 (Pendaftaran): ${rfidEvent.uid}`);
       return;
     }
 
     const matchedMember = state.visitors.find(m => m.rfidUid && normalizeRfid(m.rfidUid) === normalizeRfid(rfidEvent.uid));
 
-    // Jika di-tap di Reader 2 (Akses Masuk Wahana)
-    if (rfidEvent.reader === 2) {
-      if (matchedMember) {
-        selectedVisitorId = matchedMember.id;
-        const select = document.getElementById('measurement-visitor');
-        if (select) select.value = matchedMember.id;
-        updateConnectionUI();
-        void handleRideValidation(matchedMember, 2);
-      } else {
-        void sendSerialCommand('n');
-        toast(`Kartu RFID ${rfidEvent.uid} di Reader Akses belum terdaftar sebagai member.`, true);
-      }
-      return;
-    }
-
-    // Jika di-tap di Reader 1 (Pendaftaran Member)
+    // Pemrosesan Member via Reader 1 (Pendaftaran Member)
     if (matchedMember) {
       selectedVisitorId = matchedMember.id;
       const select = document.getElementById('measurement-visitor');
       if (select) select.value = matchedMember.id;
       updateConnectionUI();
-      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via Reader Pendaftaran.`);
+      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via Reader 1 (Pendaftaran).`);
     } else {
-      toast(`Kartu RFID ${rfidEvent.uid} baru terdeteksi. Membuka formulir pendaftaran member…`);
+      toast(`Kartu RFID ${rfidEvent.uid} terdeteksi di Reader 1. Membuka formulir pendaftaran member…`);
       memberForm(rfidEvent.uid);
     }
     return;
@@ -941,6 +940,15 @@ document.addEventListener('click', event => {
       toast(`Member "${name}" berhasil dihapus.`);
     } catch (err) {
       toast(err.message, true);
+    }
+  }
+  else if (action === 'toggle-serial') {
+    if (serialSession) {
+      if (confirm('Putuskan koneksi serial ESP32?')) {
+        void disconnectDevice();
+      }
+    } else {
+      void connectDevice();
     }
   }
   else if (action === 'connect') void connectDevice();
