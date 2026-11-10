@@ -548,6 +548,7 @@ void loop() {
         Serial.printf(" (Panjang: %d byte)\n", rfid2.uid.size);
         // Respon buzzer pada Reader 2 (bip sukses / gagal) dikendalikan interaktif
         // oleh hasil verifikasi tinggi wahana dari dashboard via serial ('b' / 'n').
+        buzzerBeepSingle();
         rfid2.haltA();
       }
     }
