@@ -1,16 +1,21 @@
-import { repository, addVisitor, recordMeasurement, csvExport } from './data.mjs';
-import { parseDeviceLine } from './serial-protocol.mjs';
-import { OBJECT_DEFAULTS, evaluateObjectDetection, objectError, validateObjectRange } from './object-detection.mjs';
-import { OBJECT_TESTS_STORAGE_KEY, appendObjectTest, createEmptyObjectTests, createObjectTestResult, loadObjectTests, objectTestsCsv } from './object-tests.mjs';
+import { repository, addMember, addVisitor, deleteMember, deleteVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
+import { parseDeviceLine, parseRfidLine } from './serial-protocol.mjs';
+import { DEFAULT_RIDES, validateRideEligibility, createValidationRecord } from './ride-validator.mjs';
 import {
-  OBJECT_DIRECTIONS,
-  DEFAULT_OBJECT_DIRECTION,
-  DEFAULT_OBJECT_POSITION_MODE,
-  normalizeObjectDirection,
-  objectDirectionMeta,
-  normalizeObjectPositionMode,
-  renderObjectSvg,
-} from './object-direction.mjs';
+  loadEnvConfig,
+  getSupabaseConfig,
+  saveSupabaseConfig,
+  isConfigured as isSupabaseConfigured,
+  testConnection as testSupabaseConnection,
+  fetchMembers as fetchSupabaseMembers,
+  upsertMember as upsertSupabaseMember,
+  updateMemberHeight as updateSupabaseMemberHeight,
+  deleteMemberFromSupabase,
+  fetchRides as fetchSupabaseRides,
+  recordValidation as recordSupabaseValidation,
+  syncLocalMembersToSupabase,
+  subscribeToRealtime,
+} from './supabase-service.mjs';
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -23,21 +28,35 @@ const icon = name => ({
   close:'<path d="m6 6 12 12M6 18 18 6"/>',
   info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v1"/>',
   check:'<path d="m5 12 4 4L19 6"/>',
+  database:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+  alert:'<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
 }[name] || '<circle cx="12" cy="12" r="9"/>');
 const svg = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icon(name)}</svg>`;
 const fmt = value => Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—';
 const fmtSigned = value => `${Number(value) >= 0 ? '+' : ''}${fmt(value)}`;
 const when = value => value ? new Date(value).toLocaleString('id-ID', { dateStyle:'medium', timeStyle:'short', timeZone:'Asia/Jakarta' }) : '—';
 const todayKey = date => new Date(date).toLocaleDateString('en-CA', { timeZone:'Asia/Jakarta' });
-const navs = [['ringkasan','Ringkasan'],['pengunjung','Pengunjung'],['pengukuran','Pengukuran Live'],['riwayat','Riwayat Ukur']];
+const navs = [
+  ['ringkasan', 'Ringkasan'],
+  ['member', 'Member'],
+  ['pengukuran', 'Pengukuran Live'],
+  ['riwayat', 'Riwayat Ukur'],
+];
+
+function normalizeRoute(hash) {
+  const raw = (hash || '').replace(/^#/, '');
+  if (raw === 'pengunjung') return 'member';
+  return navs.some(item => item[0] === raw) ? raw : 'ringkasan';
+}
 
 let state;
-let route = location.hash.slice(1) || 'ringkasan';
+let route = normalizeRoute(location.hash);
 let selectedVisitorId = '';
 let serialSession = null;
 let latestFrame = null;
 let lastFrameAt = 0;
 let lastSavedSequence = null;
+let lastScannedRfid = '';
 let toastTimer;
 let historyFrom = '';
 let historyTo = '';
@@ -45,18 +64,13 @@ let historySearch = '';
 let historyStatus = 'all';
 let historyCalibration = 'all';
 let historySort = 'newest';
-let measurementMode = 'height';
-let objectSettings = { minCm: OBJECT_DEFAULTS.minCm, maxCm: OBJECT_DEFAULTS.maxCm, toleranceCm: OBJECT_DEFAULTS.toleranceCm, sampleCount: OBJECT_DEFAULTS.sampleCount };
-let objectDistances = [];
-let objectLastSequence = null;
-let objectTestStartedAt = 0;
-let objectResult = null;
-let objectRecorded = false;
-let objectTargetCm = '';
-let objectActualCm = '';
-let objectDirection = DEFAULT_OBJECT_DIRECTION;
-let objectPositionMode = DEFAULT_OBJECT_POSITION_MODE;
-let objectTests = createEmptyObjectTests();
+
+// Supabase & Wahana State
+let supabaseStatus = isSupabaseConfigured() ? 'offline' : 'unconfigured';
+let activeRides = DEFAULT_RIDES;
+let selectedRideId = 'roller-coaster';
+let lastValidation = null;
+
 const modal = $('#modal');
 
 function toast(message, error = false) {
@@ -120,6 +134,15 @@ function statusPill() {
   return '<span class="pill online"><i></i>Data live diterima</span>';
 }
 
+function cloudPill() {
+  const labels = {
+    connected: 'Cloud Terhubung',
+    offline: 'Mode Lokal',
+    unconfigured: 'Setel Supabase',
+  };
+  return `<button class="cloud-pill ${supabaseStatus}" data-action="open-db-settings" title="Pengaturan Database Supabase"><i></i>${labels[supabaseStatus] || 'Supabase'}</button>`;
+}
+
 function connectionInfo() {
   if (!serialSession) return { label:'Terputus', tone:'offline' };
   if (!isLive()) return { label:'Siaga', tone:'waiting' };
@@ -163,7 +186,7 @@ function captureState() {
   if (latestFrame?.status === 'invalid') return { ready:false, label:'Pembacaan tidak valid', tone:'alarm' };
   if (!frame) return { ready:false, label:'Menunggu data valid', tone:'waiting' };
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) return { ready:false, label:'Data sensor kedaluwarsa', tone:'waiting' };
-  if (!selectedVisitorId) return { ready:false, label:'Pilih pengunjung', tone:'waiting' };
+  if (!selectedVisitorId) return { ready:false, label:'Pilih member', tone:'waiting' };
   if (frame.sequence != null && frame.sequence === lastSavedSequence) return { ready:false, label:'Pembacaan ini sudah disimpan', tone:'good' };
   return { ready:true, label:'Siap disimpan', tone:'good' };
 }
@@ -213,8 +236,8 @@ function liveReadout(prefix = 'live') {
 }
 
 function dashboardPage() {
-  const measuredVisitors = state.visitors.filter(visitor => visitor.heightCm != null && visitor.measuredAt).length;
-  const unmeasuredVisitors = state.visitors.length - measuredVisitors;
+  const measuredMembers = state.visitors.filter(member => member.heightCm != null && member.measuredAt).length;
+  const unmeasuredMembers = state.visitors.length - measuredMembers;
   const measuredToday = state.measurements.filter(item => todayKey(item.capturedAt) === todayKey(new Date())).length;
   const latest = state.measurements[0];
   const previous = state.measurements.slice(1, 5);
@@ -223,16 +246,16 @@ function dashboardPage() {
     ? `<div class="latest-primary">
         <span class="latest-label">Hasil tersimpan terbaru</span>
         <div class="latest-value">${fmt(latest.heightCm)}<small>cm</small></div>
-        <span class="latest-name">${escape(latest.visitorName)}</span>
+        <span class="latest-name">${escape(latest.visitorName)}${latest.memberRfid ? ` <code class="rfid-badge">${escape(latest.memberRfid)}</code>` : ''}</span>
         <span class="latest-time">${when(latest.capturedAt)} WIB · jarak ${fmt(latest.distanceCm)} cm</span>
       </div>
       ${previous.length ? `<ul class="latest-list" aria-label="Pengukuran sebelumnya">${previous.map(row => `<li class="latest-row"><div><span class="latest-row-name">${escape(row.visitorName)}</span><span class="latest-row-time">${when(row.capturedAt)}</span></div><span class="latest-row-value">${fmt(row.heightCm)} cm</span></li>`).join('')}</ul>` : ''}`
-    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan ESP32, pilih pengunjung, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
-  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi pengunjung, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('cable')} Buka pengukuran live</a>`)
+    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan ESP32, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
+  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('cable')} Buka pengukuran live</a>`)
     + `<section class="summary-strip" aria-label="Ringkasan operasional">
-        ${summaryCell('Pengunjung', state.visitors.length, 'orang', `${measuredVisitors} sudah diukur`)}
-        ${summaryCell('Sudah diukur', measuredVisitors, 'orang', 'Memiliki hasil sensor')}
-        ${summaryCell('Belum diukur', unmeasuredVisitors, 'orang', 'Menunggu pos ukur')}
+        ${summaryCell('Member', state.visitors.length, 'orang', `${measuredMembers} sudah diukur`)}
+        ${summaryCell('Sudah diukur', measuredMembers, 'orang', 'Memiliki hasil sensor')}
+        ${summaryCell('Belum diukur', unmeasuredMembers, 'orang', 'Menunggu pos ukur')}
         ${summaryCell('Hasil tersimpan', state.measurements.length, 'data', `${measuredToday} hari ini · WIB`)}
         <div class="summary-cell" id="device-connection-metric"><span class="summary-label">Koneksi perangkat</span><span class="summary-value summary-status ${connection.tone}" id="device-connection-value">${connection.label}</span><span class="summary-note">ESP32 · USB Serial 115200</span></div>
       </section>
@@ -244,7 +267,7 @@ function dashboardPage() {
         <section class="panel latest-panel">
           <div class="panel-header"><div><p class="eyebrow">Ledger pengukuran</p><h2>Pengukuran terakhir</h2></div><a class="text-button" href="#riwayat">Riwayat lengkap</a></div>
           ${latestPanel}
-          <div class="panel-actions"><a class="btn" href="#pengunjung">Kelola pengunjung</a></div>
+          <div class="panel-actions"><a class="btn" href="#member">Kelola member</a></div>
         </section>
       </div>`;
 }
@@ -256,440 +279,98 @@ function genderText(value) {
   return '—';
 }
 
-function visitorTable() {
-  if (!state.visitors.length) return '<div class="empty"><strong>Belum ada pengunjung terdaftar.</strong>Catat identitas manual sebelum menyimpan hasil pengukuran.<br><button class="text-button" data-action="add-visitor">Tambah pengunjung pertama</button></div>';
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="registry-table"><caption class="sr-only">Buku registrasi pengunjung</caption><thead><tr><th>No.</th><th>Nama</th><th>Usia</th><th>Jenis kelamin</th><th class="numeric">Berat badan</th><th class="numeric">Tinggi badan</th><th>Status pengukuran</th><th>Waktu pengukuran</th></tr></thead><tbody>${state.visitors.map((visitor, index) => {
-    const measured = visitor.heightCm != null && Boolean(visitor.measuredAt);
-    return `<tr><td class="numeric row-index">${index + 1}</td><td><strong class="visitor-name">${escape(visitor.name)}</strong>${visitor.notes ? `<span class="row-note visitor-notes">${escape(visitor.notes)}</span>` : ''}</td><td class="numeric">${visitor.age ?? '—'}</td><td>${genderText(visitor.gender)}</td><td class="numeric">${visitor.weightKg == null ? '—' : `${fmt(visitor.weightKg)} kg`}</td><td class="numeric"><strong>${visitor.heightCm == null ? '—' : `${fmt(visitor.heightCm)} cm`}</strong>${measured ? '<span class="row-note">Dari sensor</span>' : ''}</td><td><span class="status ${measured ? 'good' : 'waiting'}">${measured ? 'Sudah diukur' : 'Belum diukur'}</span></td><td>${visitor.measuredAt ? when(visitor.measuredAt) : '—'}</td></tr>`;
+function memberTable() {
+  if (!state.visitors.length) return '<div class="empty"><strong>Belum ada member terdaftar.</strong>Catat identitas kartu RFID dan data member sebelum menyimpan hasil pengukuran.<br><button class="text-button" data-action="add-member">Tambah member pertama</button></div>';
+  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="registry-table"><caption class="sr-only">Buku registrasi member</caption><thead><tr><th>No.</th><th>UID Kartu RFID</th><th>Nama</th><th>Usia</th><th>Jenis kelamin</th><th class="numeric">Berat badan</th><th class="numeric">Tinggi badan</th><th>Status pengukuran</th><th>Waktu pengukuran</th><th>Aksi</th></tr></thead><tbody>${state.visitors.map((member, index) => {
+    const measured = member.heightCm != null && Boolean(member.measuredAt);
+    return `<tr><td class="numeric row-index">${index + 1}</td><td><code class="rfid-badge">${escape(member.rfidUid || '—')}</code></td><td><strong class="visitor-name member-name">${escape(member.name)}</strong>${member.notes ? `<span class="row-note visitor-notes">${escape(member.notes)}</span>` : ''}</td><td class="numeric">${member.age ?? '—'}</td><td>${genderText(member.gender)}</td><td class="numeric">${member.weightKg == null ? '—' : `${fmt(member.weightKg)} kg`}</td><td class="numeric"><strong>${member.heightCm == null ? '—' : `${fmt(member.heightCm)} cm`}</strong>${measured ? '<span class="row-note">Dari sensor</span>' : ''}</td><td><span class="status ${measured ? 'good' : 'waiting'}">${measured ? 'Sudah diukur' : 'Belum diukur'}</span></td><td>${member.measuredAt ? when(member.measuredAt) : '—'}</td><td><button class="icon-button delete-member-btn" data-action="delete-member" data-id="${escape(member.id)}" data-name="${escape(member.name)}" data-rfid="${escape(member.rfidUid || '')}" title="Hapus member ${escape(member.name)}" aria-label="Hapus member">${svg('close')}</button></td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
-function visitorsPage() {
-  const measured = state.visitors.filter(visitor => visitor.heightCm != null && visitor.measuredAt).length;
+function membersPage() {
+  const measured = state.visitors.filter(member => member.heightCm != null && member.measuredAt).length;
   const unmeasured = state.visitors.length - measured;
-  return header('Buku registrasi pengunjung', 'Identitas dicatat manual. Tinggi badan hanya berasal dari pembacaan sensor, bukan input operator.', `<button class="btn primary" data-action="add-visitor">${svg('plus')} Tambah pengunjung</button>`)
-    + `<section class="panel"><div class="panel-header"><div><h2>Pengunjung terdaftar <span class="count">${state.visitors.length}</span></h2><p>${measured} sudah diukur · ${unmeasured} belum diukur · data tersimpan lokal di peramban ini.</p></div></div>${visitorTable()}</section>`;
+  return header('Buku registrasi member', 'Identitas kartu RFID dan data member dicatat saat registrasi. Tinggi badan diukur via sensor HC-SR04.', `<button class="btn primary" data-action="add-member">${svg('plus')} Tambah member</button>`)
+    + `<section class="panel"><div class="panel-header"><div><h2>Member terdaftar <span class="count">${state.visitors.length}</span></h2><p>${measured} sudah diukur · ${unmeasured} belum diukur · ${supabaseStatus === 'connected' ? 'tersinkronisasi ke Supabase Cloud' : 'tersimpan lokal di peramban ini'}.</p></div></div>${memberTable()}</section>`;
 }
 
-function visitorOptions() {
-  return state.visitors.map(visitor => `<option value="${escape(visitor.id)}" ${visitor.id === selectedVisitorId ? 'selected' : ''}>${escape(visitor.name)}${visitor.age ? ` · ${visitor.age} th` : ''}</option>`).join('');
+function memberOptions() {
+  return state.visitors.map(member => `<option value="${escape(member.id)}" ${member.id === selectedVisitorId ? 'selected' : ''}>${escape(member.name)}${member.rfidUid ? ` [${escape(member.rfidUid)}]` : ''}${member.age ? ` · ${member.age} th` : ''}${member.heightCm != null ? ` (${fmt(member.heightCm)} cm)` : ''}</option>`).join('');
 }
 
-function measurementModeBar() {
-  const objectMode = measurementMode === 'object';
-  return `<div class="measurement-mode-bar">
-    <div class="mode-tabs" role="group" aria-label="Mode pengukuran live">
-      <button type="button" class="mode-tab" data-action="measurement-mode" data-mode="height" aria-pressed="${objectMode ? 'false' : 'true'}">Pengukuran tinggi</button>
-      <button type="button" class="mode-tab" data-action="measurement-mode" data-mode="object" aria-pressed="${objectMode ? 'true' : 'false'}">Deteksi objek</button>
-    </div>
-    <p class="mode-note">${objectMode ? 'Pengujian objek universal dengan HC-SR04 (6 arah pengujian manual) dan tidak menambah riwayat pengunjung.' : 'Mode pengukuran tinggi tetap menjadi alur penyimpanan pengunjung.'}</p>
-  </div>`;
-}
-
-function objectDetectionText(code) {
-  return ({
-    IN_RANGE: 'Dalam rentang target',
-    TOO_CLOSE: 'Terlalu dekat',
-    TOO_FAR: 'Terlalu jauh',
-    INVALID: 'Echo tidak valid',
-    WAITING: 'Menunggu data',
-    OFFLINE: 'Perangkat offline',
-  })[code] || 'Menunggu data';
-}
-
-function objectStatusView(result, started) {
-  const detection = objectDetectionText(result?.detectionStatus);
-  const detectionTone = ({
-    IN_RANGE: 'good',
-    TOO_CLOSE: 'alarm',
-    TOO_FAR: 'waiting',
-    INVALID: 'alarm',
-    WAITING: 'waiting',
-    OFFLINE: 'alarm',
-  })[result?.detectionStatus] || 'waiting';
-  const common = { detection, detectionTone };
-  if (!serialSession) {
-    return { ...common, stability:'DEVICE_OFFLINE', tone:'alarm', note:'Hubungkan ESP32 untuk mulai menerima echo sensor.' };
-  }
-  if (result?.status === 'DEVICE_OFFLINE') {
-    return { ...common, stability:'DEVICE_OFFLINE', tone:'alarm', note:'Data sensor tidak diperbarui lebih dari 3 detik. Buffer pengujian dikosongkan.' };
-  }
-  if (!started) {
-    if (result?.status === 'INVALID') {
-      return { ...common, stability:'INVALID', tone:'alarm', note:'Echo tidak valid. Periksa posisi sensor dan objek, lalu mulai pengujian.' };
-    }
-    if (result?.detectionStatus === 'TOO_CLOSE' || result?.detectionStatus === 'TOO_FAR') {
-      return { ...common, stability:'NO_OBJECT', tone:'waiting', note:`Pratinjau berada di luar rentang ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm. Tekan Mulai pengujian untuk mencoba.` };
-    }
-    if (!result || result.detectionStatus === 'WAITING') {
-      return { ...common, stability:'NO_OBJECT', tone:'waiting', note:'Menunggu baris data dari ESP32. Tekan Mulai pengujian setelah echo terbaca.' };
-    }
-    return { ...common, stability:'SIAP DIMULAI', tone:'waiting', note:'Echo valid terdeteksi. Tekan Mulai pengujian untuk mengumpulkan 5 sampel.' };
-  }
-  if (result?.status === 'INVALID') {
-    return { ...common, stability:'INVALID', tone:'alarm', note:'Echo tidak valid. Buffer pengujian dikosongkan; tunggu pembacaan valid berikutnya.' };
-  }
-  if (result?.status === 'NO_OBJECT' && result.detectionStatus === 'WAITING') {
-    return { ...common, stability:'NO_OBJECT', tone:'waiting', note:'Menunggu baris data dari ESP32 sebelum mengambil sampel baru.' };
-  }
-  if (result?.status === 'NO_OBJECT') {
-    return { ...common, stability:'NO_OBJECT', tone: result.detectionStatus === 'TOO_CLOSE' ? 'alarm' : 'waiting', note:`Objek di luar rentang ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm. Buffer dikosongkan.` };
-  }
-  if (result?.status === 'STABLE') {
-    return { ...common, stability:'STABLE', tone:'good', note:`Rentang ${fmt(result.stabilityRangeCm)} cm dalam toleransi ${fmt(result.toleranceCm)} cm.` };
-  }
-  if (result?.status === 'UNSTABLE') {
-    return { ...common, stability:'UNSTABLE', tone:'waiting', note:`Rentang ${fmt(result.stabilityRangeCm)} cm melebihi toleransi ${fmt(result.toleranceCm)} cm. Ulangi pengujian.` };
-  }
-  if (result?.status === 'COLLECTING') {
-    return { ...common, stability:'COLLECTING', tone:'waiting', note:`${result.sampleCount}/${result.sampleTarget} sampel. Pertahankan posisi objek tetap diam di area target.` };
-  }
-  return { ...common, stability:'NO_OBJECT', tone:'waiting', note:'Menunggu data sensor.' };
-}
-
-function directionSelector() {
-  const meta = objectDirectionMeta(objectDirection);
-  const cards = OBJECT_DIRECTIONS.map(dir => {
-    const isActive = dir.code === objectDirection;
-    return `<button type="button" class="direction-card ${isActive ? 'is-active' : ''}" data-action="object-direction" data-direction="${dir.code}" aria-pressed="${isActive}">
-      <div class="direction-card-top"><span class="direction-arrow">${dir.arrow}</span><span class="direction-axis-badge">${dir.axisCode}</span></div>
-      <span class="direction-title">${dir.label}</span>
-      <span class="direction-code">${dir.code}</span>
-      <span class="direction-hint">${dir.hint}</span>
-    </button>`;
+function rideOptions() {
+  return activeRides.map(ride => {
+    const maxInfo = ride.maxHeightCm ? `, Max: ${ride.maxHeightCm} cm` : '';
+    return `<option value="${escape(ride.id)}" ${ride.id === selectedRideId ? 'selected' : ''}>${escape(ride.name)} (Min: ${ride.minHeightCm} cm${maxInfo})</option>`;
   }).join('');
-  return `<div class="direction-selector-wrapper">
-    <div class="direction-header">
-      <span class="direction-kicker">Arah Pengujian Sensor</span>
-      <p class="direction-status-text">Arah aktif: <strong>${meta.label} (${meta.axisCode})</strong> &mdash; ${meta.waveDirection}</p>
+}
+
+function validationBannerView() {
+  if (!lastValidation) {
+    return `<div class="validation-banner">
+      <span class="validation-badge"><span class="status waiting">Siaga Validasi</span></span>
+      <p class="validation-detail">Pilih wahana dan tap kartu member pada <strong>Reader 2 (Akses Wahana)</strong> atau klik Uji Validasi.</p>
+    </div>`;
+  }
+  const { member, ride, evaluation, timestamp } = lastValidation;
+  const isOk = evaluation.eligible;
+  return `<div class="validation-banner ${isOk ? 'eligible' : 'rejected'}">
+    <div class="validation-badge ${isOk ? 'eligible' : 'rejected'}">
+      ${svg(isOk ? 'check' : 'alert')} ${isOk ? 'LOLOS AKSES WAHANA' : 'AKSES DITOLAK'}
     </div>
-    <div class="direction-grid" role="group" aria-label="Pilihan arah pengujian sensor">${cards}</div>
-    <div class="object-hardware-warning">
-      <span class="warning-badge">${svg('info')} HARDWARE</span>
-      <p class="warning-message">Orientasi fisik sensor HC-SR04 <strong>harus disesuaikan secara manual</strong> oleh operator. Satu sensor hanya mengukur jarak 1D sepanjang arah pancaran. Enam pilihan arah adalah konfigurasi pengujian, bukan enam sensor simultan.</p>
+    <div class="validation-detail">
+      <strong>${escape(member.name)}</strong> (${escape(member.rfidUid || 'UID: —')}) · Tinggi: <strong>${fmt(evaluation.height)} cm</strong>
+      <br>Wahana: <strong>${escape(ride.name)}</strong> (Batas min: ${ride.minHeightCm} cm)
+      <br><small>${escape(evaluation.reason)}</small>
     </div>
+    <span class="validation-meta">${when(timestamp)} WIB · Sinyal buzzer: ${isOk ? 'Bip normal' : 'Peringatan 3x'}</span>
   </div>`;
-}
-
-function objectVisualization() {
-  const vizState = !serialSession ? 'offline' : 'idle';
-  const liveD = latestFrame?.status === 'ok' ? latestFrame.distanceCm : null;
-  const svgContent = renderObjectSvg({
-    direction: objectDirection,
-    liveDistanceCm: liveD,
-    targetDistanceCm: Number(objectTargetCm) || null,
-    minCm: objectSettings.minCm,
-    maxCm: objectSettings.maxCm,
-    positionMode: objectPositionMode,
-    state: vizState,
-  });
-  return `<div class="object-visual">
-    <div class="object-viz" id="object-viz" data-state="${vizState}" data-direction="${objectDirection}">
-      ${svgContent}
-    </div>
-    <p class="object-viz-caption"><span>Objek target universal. Bukan computer vision. HC-SR04 hanya mengukur jarak 1D.</span><strong id="object-viz-state">${vizState.toUpperCase()}</strong></p>
-  </div>`;
-}
-
-function objectControlPanel() {
-  const started = Boolean(objectTestStartedAt);
-  const capture = objectCaptureState();
-  const presets = [30, 40, 50, 60].map(value => `<button type="button" class="preset-btn ${String(Number(objectTargetCm)) === String(value) ? 'is-active' : ''}" data-action="object-preset" data-cm="${value}">${value} cm</button>`).join('');
-  return `<section class="panel object-control-panel">
-    <div class="panel-header"><div><p class="eyebrow">Kontrol pengujian</p><h2>Snapshot hasil objek</h2><p>Isi jarak aktual dari meteran; error dihitung dari selisih jarak sensor.</p></div></div>
-    <div class="object-control-body">
-      <div class="field">
-        <label for="object-target">Jarak target pengujian (cm)</label>
-        <input id="object-target" type="number" min="1" max="400" step="0.1" inputmode="decimal" placeholder="30, 40, 50, atau 60" value="${escape(objectTargetCm)}">
-        <div class="object-presets" aria-label="Pilihan jarak target">${presets}</div>
-      </div>
-      <div class="field object-actual-desktop">
-        <label for="object-actual">Jarak aktual dari meteran (cm) <span class="req">*</span></label>
-        <input id="object-actual" type="number" min="1" max="400" step="0.1" inputmode="decimal" placeholder="Hasil ukur meteran" value="${escape(objectActualCm)}">
-        <p class="field-help">Jangan mengisi angka dari sensor. Jarak aktual wajib diukur manual.</p>
-      </div>
-      <div class="field-row object-range-fields">
-        <div class="field"><label for="object-min">Batas minimum (cm)</label><input id="object-min" type="number" min="2" max="399" step="0.1" value="${objectSettings.minCm}"></div>
-        <div class="field"><label for="object-max">Batas maksimum (cm)</label><input id="object-max" type="number" min="3" max="400" step="0.1" value="${objectSettings.maxCm}"></div>
-      </div>
-      <p class="field-help">Stabilitas memakai 5 sampel valid berturut-turut dengan toleransi ${fmt(objectSettings.toleranceCm)} cm.</p>
-      <div class="capture-readout object-summary" aria-label="Ringkasan pengujian objek">
-        <div class="capture-row"><span>Jarak target</span><strong id="object-target-summary">- cm</strong></div>
-        <div class="capture-row"><span>Jarak aktual meteran</span><strong id="object-actual-summary">- cm</strong></div>
-        <div class="capture-row"><span>Error (terukur - aktual)</span><strong id="object-error">- cm</strong></div>
-        <div class="capture-row"><span>Durasi pengujian</span><strong id="object-duration">-</strong></div>
-      </div>
-      <div class="object-actions">
-        <button class="btn primary" id="object-start" data-action="object-start" ${!serialSession || started ? 'disabled' : ''}>Mulai pengujian</button>
-        <button class="btn" id="object-repeat" data-action="object-repeat" ${!serialSession || !started ? 'disabled' : ''}>Ulangi pengujian</button>
-        <button class="btn" id="object-reset" data-action="object-reset" ${!started && !objectTargetCm && !objectActualCm ? 'disabled' : ''}>Reset pengujian</button>
-      </div>
-      <button class="btn primary full object-record" data-action="object-record" id="object-record" ${capture.ready ? '' : 'disabled'}>${svg('check')} Catat hasil pengujian</button>
-      <p class="object-capture-state" id="object-capture-state">${capture.label}</p>
-      <details class="object-technical">
-        <summary>Lihat detail teknis</summary>
-        <dl class="object-tech-grid">
-          <div><dt>Urutan frame</dt><dd id="object-tech-sequence">-</dd></div>
-          <div><dt>Status frame</dt><dd id="object-tech-frame">-</dd></div>
-          <div><dt>Buffer sampel</dt><dd id="object-tech-buffer">-</dd></div>
-          <div><dt>Rentang target</dt><dd id="object-tech-range">${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm</dd></div>
-          <div><dt>Toleransi</dt><dd id="object-tech-tolerance">${fmt(objectSettings.toleranceCm)} cm</dd></div>
-          <div><dt>Umur data</dt><dd id="object-tech-age">-</dd></div>
-        </dl>
-        <p class="field-help">Buffer tidak disimpan per frame. Hanya snapshot yang dicatat operator yang masuk dataset.</p>
-      </details>
-    </div>
-  </section>`;
-}
-
-function objectDataset() {
-  if (!objectTests.results.length) {
-    return '<div class="empty"><strong>Belum ada hasil pengujian objek.</strong>Mulai pengujian, isi jarak aktual dari meteran, lalu catat snapshot hasil.<br><span class="small">Dataset ini terpisah dari riwayat pengunjung.</span></div>';
-  }
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="object-result-table"><caption class="sr-only">Dataset pengujian deteksi objek</caption><thead><tr><th>Waktu</th><th>Arah</th><th class="numeric">Target</th><th class="numeric">Aktual</th><th class="numeric">Terukur</th><th class="numeric">Error</th><th>Deteksi</th><th>Kestabilan</th><th class="numeric">Rentang</th><th class="numeric">Sampel</th></tr></thead><tbody>${objectTests.results.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td>${row.direction || 'DOWN'}</td><td class="numeric">${fmt(row.targetDistanceCm)} cm</td><td class="numeric">${fmt(row.actualDistanceCm)} cm</td><td class="numeric">${row.measuredDistanceCm == null ? '-' : `${fmt(row.measuredDistanceCm)} cm`}</td><td class="numeric">${row.errorCm == null ? '-' : `${fmtSigned(row.errorCm)} cm`}</td><td>${objectDetectionText(row.detectionStatus)}<span class="row-note">${row.detectionStatus}</span></td><td><span class="status ${row.stabilityStatus === 'STABLE' ? 'good' : row.stabilityStatus === 'INVALID' || row.stabilityStatus === 'DEVICE_OFFLINE' ? 'alarm' : 'waiting'}">${row.stabilityStatus}</span></td><td class="numeric">${row.stabilityRangeCm == null ? '-' : `${fmt(row.stabilityRangeCm)} cm`}</td><td class="numeric">${row.sampleCount}/5</td></tr>`).join('')}</tbody></table></div>`;
-}
-
-function objectGuidePanel() {
-  const meta = objectDirectionMeta(objectDirection);
-  return `<section class="panel guide-panel">
-    <div class="panel-header"><div><p class="eyebrow">Panduan pengujian</p><h2>Deteksi Objek Universal</h2></div><span class="guide-formula">5 sampel · toleransi ${fmt(objectSettings.toleranceCm)} cm</span></div>
-    <dl class="guide-grid">
-      <div class="guide-item"><dt>Posisi objek</dt><dd>Tempatkan objek datar (kubus, balok, atau bidang rata) pada sumbu ${meta.axisCode} di dalam rentang target ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm.</dd></div>
-      <div class="guide-item"><dt>Orientasi sensor</dt><dd>Arahkan sensor HC-SR04 secara manual ke arah ${meta.label} (${meta.code}). Enam arah pengujian adalah pilihan konfigurasi, bukan enam sensor.</dd></div>
-      <div class="guide-item"><dt>Kestabilan</dt><dd>Tahan posisi objek tanpa gerakan. Buffer direset setelah echo invalid atau objek keluar rentang.</dd></div>
-      <div class="guide-item"><dt>Jarak aktual</dt><dd>Ukur target dengan meteran dan masukkan manual. Error = jarak terukur sensor − jarak aktual.</dd></div>
-      <div class="guide-item"><dt>Batas perangkat</dt><dd>HC-SR04 hanya mengukur jarak 1D sepanjang arah pancaran. Tidak ada kamera, pengenalan objek, atau pelacakan koordinat 3D.</dd></div>
-      <div class="guide-item"><dt>Bukan multi-sensor</dt><dd>Untuk mengukur enam arah secara bersamaan, diperlukan beberapa sensor atau mekanisme pengarah. Satu HC-SR04 mengukur satu arah per pengujian.</dd></div>
-    </dl>
-    <div class="object-limit-note"><strong>Bukan computer vision.</strong> Visualisasi kubus hanya representasi posisi target. Sistem tidak mengetahui bentuk, identitas, atau posisi lateral objek.</div>
-  </section>`;
-}
-
-function objectMeasurementView() {
-  const started = Boolean(objectTestStartedAt);
-  const status = objectStatusView(objectResult, started);
-  const sampleCount = started ? objectResult?.sampleCount ?? 0 : 0;
-  const pips = Array.from({ length: OBJECT_DEFAULTS.sampleCount }, (_, index) => `<span class="object-sample-pip ${index < sampleCount ? 'filled' : ''}"></span>`).join('');
-  const dirMeta = objectDirectionMeta(objectDirection);
-  return `${directionSelector()}
-  <div class="measurement-layout object-measurement-layout">
-    <section class="panel instrument-panel object-instrument">
-      <div class="panel-header"><div><p class="instrument-kicker">Mode pengujian objek · ${dirMeta.label} (${dirMeta.axisCode})</p><h2>Deteksi Objek Universal &mdash; HC-SR04</h2><p>Echo ultrasonik · arah ${dirMeta.label} · target ${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm · ${OBJECT_DEFAULTS.sampleCount} sampel</p></div>${statusPill()}</div>
-      <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${serialSession ? 'disabled' : ''}>${svg('cable')} Hubungkan ESP32</button><button class="btn" id="disconnect-device" data-action="disconnect" ${serialSession ? '' : 'disabled'}>Putuskan</button></div>
-      <p class="device-note" id="serial-help">Tutup Serial Monitor Arduino IDE sebelum menghubungkan perangkat. Objek diuji tanpa menyimpan data pengunjung.</p>
-      ${objectVisualization()}
-      <div class="object-actual-mobile">
-        <div class="field">
-          <label for="object-actual-mobile">Jarak aktual dari meteran (cm) <span class="req">*</span></label>
-          <input id="object-actual-mobile" type="number" min="1" max="400" step="0.1" inputmode="decimal" placeholder="Hasil ukur meteran" value="${escape(objectActualCm)}">
-          <p class="field-help">Jangan mengisi angka dari sensor. Jarak aktual wajib diukur manual.</p>
-        </div>
-      </div>
-      <div class="object-live-grid">
-        <div class="object-live-primary">
-          <span class="instrument-label">Jarak objek dari sensor (${dirMeta.axisCode})</span>
-          <div class="object-distance"><strong id="object-distance">-</strong><small>cm</small></div>
-          <span class="reading-meta" id="object-last">Menunggu koneksi perangkat</span>
-        </div>
-        <div class="object-live-state">
-          <span class="instrument-label">Status kestabilan</span>
-          <strong class="object-status-value ${status.tone}" id="object-stability-status">${status.stability}</strong>
-          <p class="object-status-note" id="object-status-note">${status.note}</p>
-          <div class="object-sample-pips" id="object-sample-pips" aria-label="Sampel stabil terkumpul">${pips}</div>
-        </div>
-      </div>
-      <dl class="object-metrics">
-        <div><dt>Status deteksi</dt><dd><span class="status ${status.detectionTone}" id="object-detection-status">${status.detection}</span></dd></div>
-        <div><dt>Rentang stabilitas</dt><dd id="object-range">-</dd></div>
-        <div><dt>Sampel</dt><dd id="object-samples">0/${OBJECT_DEFAULTS.sampleCount}</dd></div>
-        <div><dt>Rentang target</dt><dd id="object-target-range">${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm</dd></div>
-        <div><dt>Arah pengujian</dt><dd id="object-direction-status">${dirMeta.label} (${dirMeta.axisCode})</dd></div>
-      </dl>
-    </section>
-    ${objectControlPanel()}
-  </div>
-  ${objectGuidePanel()}
-  <section class="panel object-dataset-panel">
-    <div class="panel-header"><div><p class="eyebrow">Dataset kalibrasi</p><h2>Hasil pengujian objek <span class="count" id="object-dataset-count">${objectTests.results.length}</span></h2><p>Snapshot eksplisit, terpisah dari riwayat pengunjung.</p></div><button class="btn" data-action="export-object-csv">${svg('download')} Ekspor CSV</button></div>
-    <div id="object-dataset-region">${objectDataset()}</div>
-  </section>`;
-}
-
-function objectCaptureState() {
-  if (!objectTestStartedAt) return { ready:false, label:'Mulai pengujian terlebih dahulu.' };
-  if (objectRecorded) return { ready:false, label:'Hasil pengujian ini sudah dicatat.' };
-  if (!serialSession) return { ready:false, label:'ESP32 belum terhubung.' };
-  if (!latestFrame) return { ready:false, label:'Menunggu data sensor.' };
-  if (!lastFrameAt || Date.now() - lastFrameAt > 3000) return { ready:false, label:'Data sensor sudah kedaluwarsa.' };
-  if (!Number.isFinite(Number(objectTargetCm)) || Number(objectTargetCm) < 1 || Number(objectTargetCm) > 400) return { ready:false, label:'Isi jarak target pengujian.' };
-  if (!Number.isFinite(Number(objectActualCm)) || Number(objectActualCm) < 1 || Number(objectActualCm) > 400) return { ready:false, label:'Isi jarak aktual dari meteran.' };
-  if (objectResult?.status === 'COLLECTING' && !objectResult.sampleCount) return { ready:false, label:'Menunggu sampel pertama setelah pengujian dimulai.' };
-  return { ready:true, label:'Snapshot siap dicatat.' };
-}
-
-function objectFrameAgeText() {
-  if (!serialSession) return 'Perangkat terputus';
-  if (!lastFrameAt) return latestFrame?.status === 'invalid' ? 'Frame tidak valid diterima' : 'Menunggu data sensor';
-  const age = Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000));
-  const relative = age === 0 ? 'baru saja' : age < 60 ? `${age} detik lalu` : `${Math.round(age / 60)} menit lalu`;
-  return latestFrame?.status === 'invalid' ? `Frame tidak valid ${relative}` : `Frame terakhir ${relative}`;
-}
-
-function objectDurationText() {
-  if (!objectTestStartedAt) return '-';
-  const seconds = Math.max(0, (Date.now() - objectTestStartedAt) / 1000);
-  return `${seconds.toFixed(1)} dtk`;
-}
-
-function updateObjectVisual(result) {
-  const viz = $('#object-viz');
-  if (!viz) return;
-  const started = Boolean(objectTestStartedAt);
-  const vizState = !serialSession || result?.status === 'DEVICE_OFFLINE'
-    ? 'offline'
-    : result?.status === 'INVALID'
-      ? 'invalid'
-      : result?.detectionStatus === 'TOO_CLOSE'
-        ? 'too-close'
-        : result?.detectionStatus === 'TOO_FAR'
-          ? 'too-far'
-          : !started
-            ? 'idle'
-            : result?.status === 'STABLE'
-              ? 'stable'
-              : result?.status === 'UNSTABLE'
-                ? 'unstable'
-                : 'collecting';
-  const distance = Number.isFinite(Number(result?.distanceCm)) ? Number(result.distanceCm) : null;
-  const liveD = result?.distanceCm ?? null;
-  const svgContent = renderObjectSvg({
-    direction: objectDirection,
-    liveDistanceCm: liveD,
-    targetDistanceCm: Number(objectTargetCm) || null,
-    minCm: objectSettings.minCm,
-    maxCm: objectSettings.maxCm,
-    positionMode: objectPositionMode,
-    state: vizState,
-  });
-  viz.innerHTML = svgContent;
-  viz.dataset.state = vizState;
-  viz.dataset.direction = objectDirection;
-  const vizStateEl = $('#object-viz-state');
-  if (vizStateEl) vizStateEl.textContent = vizState.toUpperCase().replace('-', '_');
-  const dirMeta = objectDirectionMeta(objectDirection);
-  setText('object-direction-status', `${dirMeta.label} (${dirMeta.axisCode})`);
-  $$('.direction-card').forEach(card => {
-    const isActive = card.dataset.direction === objectDirection;
-    card.classList.toggle('is-active', isActive);
-    card.setAttribute('aria-pressed', String(isActive));
-  });
-}
-
-function updateObjectUI() {
-  if (measurementMode !== 'object' || route !== 'pengukuran') return;
-  const now = Date.now();
-  const started = Boolean(objectTestStartedAt);
-  const evaluation = evaluateObjectDetection({
-    connected: Boolean(serialSession),
-    frame: latestFrame,
-    lastFrameAt,
-    now,
-    distances: started ? objectDistances : [],
-    lastSequence: started ? objectLastSequence : latestFrame?.sequence ?? null,
-    range: objectSettings,
-  });
-  if (started) {
-    objectDistances = evaluation.distances;
-    objectLastSequence = evaluation.lastSequence;
-    objectResult = evaluation;
-  } else {
-    objectResult = { ...evaluation, status:'NO_OBJECT', sampleCount:0, distances:[], stabilityRangeCm:null, measuredDistanceCm:evaluation.distanceCm };
-  }
-  const status = objectStatusView(objectResult, started);
-  const measured = Number.isFinite(Number(objectResult?.measuredDistanceCm)) ? Number(objectResult.measuredDistanceCm) : null;
-  const actual = Number(objectActualCm);
-  const error = Number.isFinite(actual) && actual >= 1 ? objectError(measured, actual) : null;
-  setText('object-distance', objectResult?.distanceCm == null ? '-' : fmt(objectResult.distanceCm));
-  setText('object-last', objectFrameAgeText());
-  setText('object-status-note', status.note);
-  setText('object-range', objectResult?.stabilityRangeCm == null ? '-' : `${fmt(objectResult.stabilityRangeCm)} cm`);
-  setText('object-samples', `${started ? objectResult?.sampleCount ?? 0 : 0}/${OBJECT_DEFAULTS.sampleCount}`);
-  setText('object-target-range', `${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm`);
-  setText('object-target-summary', Number.isFinite(Number(objectTargetCm)) && Number(objectTargetCm) > 0 ? `${fmt(objectTargetCm)} cm` : '- cm');
-  setText('object-actual-summary', Number.isFinite(actual) && actual > 0 ? `${fmt(actual)} cm` : '- cm');
-  setText('object-error', error == null ? '- cm' : `${fmtSigned(error)} cm`);
-  setText('object-duration', objectDurationText());
-  setText('object-tech-sequence', latestFrame?.sequence == null ? '-' : String(latestFrame.sequence));
-  setText('object-tech-frame', latestFrame ? `${latestFrame.status}${latestFrame.error ? ` · ${latestFrame.error}` : ''}` : '-');
-  setText('object-tech-buffer', started && objectDistances.length ? objectDistances.map(value => fmt(value)).join(' · ') : '-');
-  setText('object-tech-range', `${fmt(objectSettings.minCm)}-${fmt(objectSettings.maxCm)} cm`);
-  setText('object-tech-tolerance', `${fmt(objectSettings.toleranceCm)} cm`);
-  setText('object-tech-age', objectFrameAgeText());
-  const stability = $('#object-stability-status');
-  if (stability) {
-    stability.textContent = status.stability;
-    stability.className = `object-status-value ${status.tone}`;
-  }
-  const detection = $('#object-detection-status');
-  if (detection) {
-    detection.textContent = status.detection;
-    detection.className = `status ${status.detectionTone}`;
-  }
-  $$('#object-sample-pips .object-sample-pip').forEach((pip, index) => {
-    pip.classList.toggle('filled', index < (started ? objectResult?.sampleCount ?? 0 : 0));
-  });
-  const record = $('#object-record');
-  const capture = objectCaptureState();
-  if (record) record.disabled = !capture.ready;
-  setText('object-capture-state', capture.label);
-  const start = $('#object-start');
-  if (start) start.disabled = !serialSession || started;
-  const repeat = $('#object-repeat');
-  if (repeat) repeat.disabled = !serialSession || !started;
-  const reset = $('#object-reset');
-  if (reset) reset.disabled = !started && !objectTargetCm && !objectActualCm;
-  $$('.preset-btn').forEach(button => {
-    button.classList.toggle('is-active', String(Number(objectTargetCm)) === button.dataset.cm);
-  });
-  updateObjectVisual(objectResult);
 }
 
 function measurementPage() {
-  const objectMode = measurementMode === 'object';
-  return header('Pengukuran live', objectMode ? 'Deteksi objek universal dengan HC-SR04: enam arah pengujian manual, objek geometris universal. Snapshot disimpan sebagai dataset kalibrasi.' : 'Instrument membaca HC-SR04 secara langsung. Petugas memilih pengunjung dan menyimpan satu pembacaan yang valid.')
-    + measurementModeBar()
-    + (objectMode ? objectMeasurementView() : heightMeasurementView());
+  return header('Pengukuran live & validasi wahana', 'Instrumen membaca HC-SR04 dari atas kepala. Reader 1 untuk pendaftaran, Reader 2 untuk validasi batas tinggi wahana.')
+    + heightMeasurementView();
 }
 
 function heightMeasurementView() {
   const readiness = captureState();
   return `<div class="measurement-layout">
       <section class="panel instrument-panel device-panel">
-        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04</h2><p>Web Serial · 115200 baud · JSON per baris</p></div>${statusPill()}</div>
+        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>Web Serial · 115200 baud · Dual MFRC522</p></div>${statusPill()}</div>
         <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${serialSession ? 'disabled' : ''}>${svg('cable')} Hubungkan ESP32</button><button class="btn" id="disconnect-device" data-action="disconnect" ${serialSession ? '' : 'disabled'}>Putuskan</button></div>
         <p class="device-note" id="serial-help">Tutup Serial Monitor Arduino IDE sebelum menghubungkan perangkat. Gunakan Chrome atau Edge desktop melalui localhost atau HTTPS.</p>
         ${liveReadout('measure')}
       </section>
       <section class="panel capture-panel">
-        <div class="panel-header"><div><p class="eyebrow">Pencatatan hasil</p><h2>Simpan pengukuran</h2><p>Pilih pengunjung, lalu simpan pembacaan live yang sedang tampil.</p></div></div>
+        <div class="panel-header"><div><p class="eyebrow">Pencatatan & Validasi</p><h2>Pengukuran & Akses Wahana</h2><p>Pilih member, simpan tinggi live, dan validasi syarat wahana.</p></div></div>
         <div class="capture-body">
-          <div class="field"><label for="measurement-visitor">Pengunjung <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih pengunjung</option>${visitorOptions()}</select><p class="field-help">${state.visitors.length ? 'Identitas manual di menu Pengunjung.' : 'Belum ada pengunjung terdaftar.'} <button type="button" class="text-button inline" data-action="add-visitor">+ Tambah baru</button></p></div>
+          <div class="field"><label for="measurement-visitor">Member Terpilih <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih member</option>${memberOptions()}</select><p class="field-help">${state.visitors.length ? 'Pilih member atau dekatkan kartu ke Reader 1 / Reader 2.' : 'Belum ada member terdaftar.'} <button type="button" class="text-button inline" data-action="add-member">+ Tambah member baru</button></p></div>
           <div class="capture-readout" aria-label="Data hasil pembacaan">
             <div class="capture-row"><span>Hasil tinggi dari ESP32</span><strong id="capture-height">— cm</strong></div>
             <div class="capture-row"><span>Jarak sensor</span><strong id="capture-distance">— cm</strong></div>
             <div class="capture-row"><span>Status validitas</span><strong class="capture-validity ${readiness.tone}" id="capture-validity">${readiness.label}</strong></div>
           </div>
-          <button class="btn primary full" data-action="save-reading" id="save-reading" ${readiness.ready ? '' : 'disabled'}>${svg('check')} Simpan hasil live</button>
+          <button class="btn primary full" data-action="save-reading" id="save-reading" ${readiness.ready ? '' : 'disabled'}>${svg('check')} Simpan hasil ukur ke profil member</button>
+
+          <div class="ride-validation-section">
+            <div class="field">
+              <label for="ride-selector">Wahana Permainan Tujuan</label>
+              <select id="ride-selector">${rideOptions()}</select>
+              <p class="field-help">Tap kartu di <strong>Reader 2</strong> untuk verifikasi instan atau klik tombol di bawah.</p>
+            </div>
+            <button class="btn full" data-action="manual-validate" id="btn-manual-validate">${svg('database')} Uji Validasi Akses Wahana</button>
+            <div id="validation-banner-region">${validationBannerView()}</div>
+          </div>
         </div>
       </section>
     </div>
     <section class="panel guide-panel">
-      <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Pemasangan dan pembacaan</h2></div><span class="guide-formula">tinggi = Href − (jarak + offset)</span></div>
+      <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Dual RFID & Logika Wahana</h2></div><span class="guide-formula">tinggi = Href − (jarak + offset)</span></div>
       <dl class="guide-grid">
-        <div class="guide-item"><dt>Orientasi sensor</dt><dd>HC-SR04 menghadap lurus ke bawah di atas area pengunjung.</dd></div>
-        <div class="guide-item"><dt>Rumus tinggi</dt><dd><code>tinggi = tinggi referensi − (jarak + offset)</code></dd></div>
-        <div class="guide-item"><dt>Tinggi referensi</dt><dd>Ukur dari lantai ke permukaan depan transduser setelah perangkat terpasang.</dd></div>
-        <div class="guide-item"><dt>Offset kalibrasi</dt><dd>Diisi dari pengujian fisik dengan alat ukur pembanding. Offset 0 bukan berarti terkalibrasi.</dd></div>
+        <div class="guide-item"><dt>Reader 1 (VSPI)</dt><dd>Pos Pendaftaran: Kartu baru yang di-tap langsung membuka form registrasi member.</dd></div>
+        <div class="guide-item"><dt>Reader 2 (HSPI)</dt><dd>Pos Akses Wahana: Kartu yang di-tap langsung divalidasi dengan batas tinggi wahana terpilih.</dd></div>
+        <div class="guide-item"><dt>Sinyal Buzzer ESP32</dt><dd>ESP32 membunyikan 1x bip normal jika lolos, atau 3x bip peringatan jika tinggi kurang.</dd></div>
+        <div class="guide-item"><dt>Database Supabase</dt><dd>Data member dan log kelayakan wahana tersimpan di PostgreSQL cloud secara real-time.</dd></div>
       </dl>
     </section>`;
 }
@@ -711,7 +392,7 @@ function filteredMeasurements() {
     const day = todayKey(item.capturedAt);
     if (historyFrom && day < historyFrom) return false;
     if (historyTo && day > historyTo) return false;
-    if (term && !item.visitorName.toLowerCase().includes(term)) return false;
+    if (term && !item.visitorName.toLowerCase().includes(term) && !(item.memberRfid && item.memberRfid.toLowerCase().includes(term))) return false;
     if (historyStatus === 'normal' && item.buzzerAlarm) return false;
     if (historyStatus === 'alarm' && !item.buzzerAlarm) return false;
     if (historyCalibration === 'confirmed' && !item.calibrated) return false;
@@ -722,9 +403,9 @@ function filteredMeasurements() {
 }
 
 function measurementLedger(rows) {
-  if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Hubungkan ESP32 melalui pos pengukuran, pilih pengunjung, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
+  if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Hubungkan ESP32 melalui pos pengukuran, pilih member, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
   if (!rows.length) return '<div class="empty"><strong>Tidak ada data yang cocok.</strong>Ubah rentang tanggal atau filter, lalu coba lagi.<br><button class="text-button" data-action="clear-filter">Reset semua filter</button></div>';
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama pengunjung</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong">${escape(row.visitorName)}</span></td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples}/5 sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
+  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan member</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama member</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong member-name">${escape(row.visitorName)}</span>${row.memberRfid ? `<span class="row-note"><code class="rfid-badge">${escape(row.memberRfid)}</code></span>` : ''}</td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples}/5 sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function historyMeta(rows) {
@@ -735,7 +416,7 @@ function historyMeta(rows) {
 function historyToolbar() {
   const option = (value, label, current) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
   return `<div class="history-toolbar" aria-label="Filter riwayat pengukuran">
-    <label class="tool-field search"><span>Cari nama</span><input id="history-search" type="search" placeholder="Nama pengunjung" autocomplete="off" value="${escape(historySearch)}"></label>
+    <label class="tool-field search"><span>Cari nama / UID</span><input id="history-search" type="search" placeholder="Cari nama atau UID RFID" autocomplete="off" value="${escape(historySearch)}"></label>
     <label class="tool-field"><span>Dari</span><input id="history-from" type="date" value="${escape(historyFrom)}"></label>
     <label class="tool-field"><span>Sampai</span><input id="history-to" type="date" value="${escape(historyTo)}"></label>
     <label class="tool-field"><span>Status</span><select id="history-status">${option('all', 'Semua status', historyStatus)}${option('normal', 'Normal', historyStatus)}${option('alarm', 'Ambang buzzer', historyStatus)}</select></label>
@@ -750,9 +431,9 @@ function historyPage() {
   const exportActions = `<button class="btn" data-action="export-csv">${svg('download')} Ekspor CSV</button><button class="btn primary" data-action="print-pdf">${svg('printer')} Cetak / Simpan PDF</button>`;
   return header('Riwayat pengukuran', 'Ledger hasil aktual yang disimpan dari ESP32. Pencarian, filter, ekspor, dan cetak mengikuti data tersimpan.', exportActions)
     + `<section class="panel">
-        <div class="panel-header"><div><h2>Data pengukuran <span class="count" id="history-count">${rows.length}</span></h2><p>Rekaman hanya bertambah saat operator menekan Simpan hasil live.</p></div><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>
+        <div class="panel-header"><div><h2>Data pengukuran <span class="count" id="history-count">${rows.length}</span></h2><p>Rekaman bertambah saat operator menekan Simpan hasil ukur.</p></div><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>
         ${historyToolbar()}
-        <div class="history-meta"><span id="history-result-meta">${historyMeta(rows)}</span><span>Waktu WIB · data lokal</span></div>
+        <div class="history-meta"><span id="history-result-meta">${historyMeta(rows)}</span><span>Waktu WIB · ${supabaseStatus === 'connected' ? 'Cloud & Lokal' : 'data lokal'}</span></div>
         <div id="history-table-region">${measurementLedger(rows)}</div>
       </section>`;
 }
@@ -774,14 +455,14 @@ function render() {
     <header class="masthead">
       <div class="masthead-inner">
         <a class="brand" href="#ringkasan"><span class="brand-name">COCOMANG</span><span class="brand-caption">Smart Height Measurement System</span></a>
-        <div class="desk-identity"><span>Meja Pengujian</span><strong>Sensor Tinggi Badan</strong></div>
-        <div class="operator"><span class="mode-label">ESP32 · USB Serial · 115200</span>${statusPill()}<button class="icon-button" data-action="help" aria-label="Panduan koneksi perangkat">${svg('info')}</button></div>
+        <div class="desk-identity"><span>Pos Ukur & Wahana</span><strong>ESP32 Dual RFID</strong></div>
+        <div class="operator"><span class="mode-label">Serial 115200</span>${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan koneksi perangkat">${svg('info')}</button></div>
       </div>
       <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}</nav>
     </header>
     <div class="workspace"><div class="topbar"><span class="breadcrumb">Pos pengukuran <span>/</span> <strong>${current}</strong></span><span class="date-label">${new Date().toLocaleDateString('id-ID', { weekday:'long', day:'numeric', month:'long', year:'numeric', timeZone:'Asia/Jakarta' })}</span></div>
-      <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : route === 'pengunjung' ? visitorsPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
-        <footer class="workspace-footer"><div><strong>COCOMANG</strong><span>Smart Height Measurement System · data tersimpan lokal pada peramban ini.</span></div><button class="link-plain" data-action="help">Petunjuk perangkat dan batas integrasi</button></footer>
+      <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : (route === 'member' || route === 'pengunjung') ? membersPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
+        <footer class="workspace-footer"><div><strong>COCOMANG</strong><span>Smart Height Measurement System · ${supabaseStatus === 'connected' ? 'Terhubung ke Supabase Cloud' : 'Mode Penyimpanan Lokal'}.</span></div><button class="link-plain" data-action="help">Petunjuk perangkat & batas integrasi</button></footer>
       </main></div></div>`;
   bindPage();
   updateConnectionUI();
@@ -839,10 +520,105 @@ function updateConnectionUI() {
     const className = `capture-validity ${readiness.tone}`;
     if (validity.className !== className) validity.className = className;
   }
-  updateObjectUI();
+}
+
+async function sendSerialCommand(cmd) {
+  if (!serialSession?.port?.writable) return;
+  try {
+    const writer = serialSession.port.writable.getWriter();
+    const encoder = new TextEncoder();
+    await writer.write(encoder.encode(cmd + '\n'));
+    writer.releaseLock();
+  } catch (err) {
+    console.warn('Gagal mengirim perintah serial ke ESP32:', err);
+  }
+}
+
+async function handleRideValidation(member, readerId = 2) {
+  const ride = activeRides.find(r => r.id === selectedRideId) || activeRides[0];
+  if (!ride) return;
+
+  const currentHeight = frameNow()?.heightCm ?? member.heightCm;
+  const evaluation = validateRideEligibility(member, ride, currentHeight);
+
+  lastValidation = {
+    member,
+    ride,
+    evaluation,
+    timestamp: new Date().toISOString(),
+  };
+
+  const bannerRegion = $('#validation-banner-region');
+  if (bannerRegion) {
+    bannerRegion.innerHTML = validationBannerView();
+  }
+
+  if (evaluation.eligible) {
+    await sendSerialCommand('b'); // Bip 1x normal
+    toast(`[VALIDASI] ${member.name} LOLOS masuk wahana ${ride.name}!`);
+  } else {
+    await sendSerialCommand('n'); // Bip 3x peringatan
+    toast(`[VALIDASI] ${member.name} DITOLAK: ${evaluation.reason}`, true);
+  }
+
+  // Rekam ke Supabase
+  try {
+    const record = createValidationRecord({
+      member,
+      ride,
+      evaluation,
+      readerId,
+      now: lastValidation.timestamp,
+    });
+    await recordSupabaseValidation(record);
+  } catch (err) {
+    console.warn('Gagal mencatat log validasi ke Supabase:', err);
+  }
 }
 
 function processSerialLine(line) {
+  const rfidEvent = parseRfidLine(line);
+  if (rfidEvent) {
+    lastScannedRfid = rfidEvent.uid;
+    const rfidInput = document.getElementById('member-rfid');
+    if (rfidInput) {
+      rfidInput.value = rfidEvent.uid;
+      rfidInput.focus();
+      toast(`Kartu RFID terdeteksi dari reader ${rfidEvent.reader} (${rfidEvent.label}): ${rfidEvent.uid}`);
+      return;
+    }
+
+    const matchedMember = state.visitors.find(m => m.rfidUid && normalizeRfid(m.rfidUid) === normalizeRfid(rfidEvent.uid));
+
+    // Jika di-tap di Reader 2 (Akses Masuk Wahana)
+    if (rfidEvent.reader === 2) {
+      if (matchedMember) {
+        selectedVisitorId = matchedMember.id;
+        const select = document.getElementById('measurement-visitor');
+        if (select) select.value = matchedMember.id;
+        updateConnectionUI();
+        void handleRideValidation(matchedMember, 2);
+      } else {
+        void sendSerialCommand('n');
+        toast(`Kartu RFID ${rfidEvent.uid} di Reader Akses belum terdaftar sebagai member.`, true);
+      }
+      return;
+    }
+
+    // Jika di-tap di Reader 1 (Pendaftaran Member)
+    if (matchedMember) {
+      selectedVisitorId = matchedMember.id;
+      const select = document.getElementById('measurement-visitor');
+      if (select) select.value = matchedMember.id;
+      updateConnectionUI();
+      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via Reader Pendaftaran.`);
+    } else {
+      toast(`Kartu RFID ${rfidEvent.uid} baru terdeteksi. Membuka formulir pendaftaran member…`);
+      memberForm(rfidEvent.uid);
+    }
+    return;
+  }
+
   const frame = parseDeviceLine(line);
   if (!frame) return;
   latestFrame = frame;
@@ -865,11 +641,8 @@ async function connectDevice() {
     latestFrame = null;
     lastFrameAt = 0;
     lastSavedSequence = null;
-    objectDistances = [];
-    objectLastSequence = null;
-    objectResult = null;
     updateConnectionUI();
-    toast('ESP32 terhubung. Menunggu baris data JSON dari firmware…');
+    toast('ESP32 terhubung. Menunggu data live dari firmware…');
 
     const reader = port.readable.getReader();
     session.reader = reader;
@@ -917,148 +690,147 @@ function openModal(title, subtitle, content) {
   if (!modal.open) modal.showModal();
 }
 
-function visitorForm() {
-  openModal('Tambah pengunjung', 'Identitas manual untuk mengaitkan hasil ukur. Tinggi badan tidak diisi manual.', `<form id="visitor-form" class="form-grid" novalidate>
+function memberForm(prefillRfid = '') {
+  const initialRfid = prefillRfid || lastScannedRfid || '';
+  openModal('Tambah member baru', 'Registrasi kartu fisik RFID dan identitas member. Tinggi badan diukur otomatis dari sensor.', `<form id="member-form" class="form-grid" novalidate>
     <div id="form-error" role="alert"></div>
-    <div class="field"><label for="visitor-name">Nama lengkap <span class="req">*</span></label><input id="visitor-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama pengunjung"></div>
-    <div class="field-row">
-      <div class="field"><label for="visitor-age">Usia (tahun)</label><input id="visitor-age" name="age" type="number" min="1" max="120" step="1" placeholder="18"></div>
-      <div class="field"><label for="visitor-gender">Jenis kelamin</label><select id="visitor-gender" name="gender"><option value="">Belum diisi</option><option value="L">Laki-laki</option><option value="P">Perempuan</option><option value="Lainnya">Lainnya</option></select></div>
-      <div class="field"><label for="visitor-weight">Berat badan (kg)</label><input id="visitor-weight" name="weightKg" type="number" min="1" max="300" step="0.1" placeholder="60"></div>
+    <div class="field">
+      <label for="member-rfid">UID Kartu RFID <span class="req">*</span></label>
+      <input id="member-rfid" name="rfidUid" required autocomplete="off" spellcheck="false" placeholder="Contoh: 04:A1:B2:C3 atau 04A1B2C3" value="${escape(initialRfid)}">
+      <p class="field-help">${serialSession ? 'Dekatkan kartu ke Reader 1 (Pendaftaran) atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
     </div>
-    <div class="field"><label for="visitor-notes">Catatan</label><textarea id="visitor-notes" name="notes" rows="3" maxlength="500" placeholder="Catatan pengukuran (opsional)"></textarea></div>
-    <p class="form-note">Tinggi badan akan diisi dari pembacaan sensor pada pos pengukuran. Tidak ada pembaca kartu identitas pada tahap ini.</p>
-    <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan pengunjung</button></div>
+    <div class="field"><label for="member-name">Nama lengkap <span class="req">*</span></label><input id="member-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama member"></div>
+    <div class="field-row">
+      <div class="field"><label for="member-age">Usia (tahun)</label><input id="member-age" name="age" type="number" min="1" max="120" step="1" placeholder="18"></div>
+      <div class="field"><label for="member-gender">Jenis kelamin</label><select id="member-gender" name="gender"><option value="">Belum diisi</option><option value="L">Laki-laki</option><option value="P">Perempuan</option><option value="Lainnya">Lainnya</option></select></div>
+      <div class="field"><label for="member-weight">Berat badan (kg)</label><input id="member-weight" name="weightKg" type="number" min="1" max="300" step="0.1" placeholder="60"></div>
+    </div>
+    <div class="field"><label for="member-notes">Catatan</label><textarea id="member-notes" name="notes" rows="3" maxlength="500" placeholder="Catatan member (opsional)"></textarea></div>
+    <p class="form-note">Kartu RFID berfungsi sebagai tiket akses member. Tinggi badan akan diukur melalui sensor ultrasonik pada pos ukur.</p>
+    <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan member</button></div>
   </form>`);
-  $('#visitor-form').addEventListener('submit', event => {
+  $('#member-form').addEventListener('submit', async event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
-      let visitor;
-      commit(next => { visitor = addVisitor(next, data); });
-      selectedVisitorId = visitor.id;
+      let member;
+      commit(next => { member = addMember(next, data); });
+      selectedVisitorId = member.id;
       modal.close();
       render();
       if (route !== 'pengukuran') location.hash = 'pengukuran';
-      toast(`Pengunjung ${visitor.name} ditambahkan.`);
+      toast(`Member ${member.name} (${member.rfidUid}) tersimpan.`);
+
+      // Sinkronkan ke Supabase jika aktif
+      if (supabaseStatus === 'connected') {
+        const synced = await upsertSupabaseMember(member);
+        if (synced) toast(`Member ${member.name} tersimpan ke Supabase Cloud.`);
+      }
     } catch (error) {
       $('#form-error').innerHTML = `<p class="error-banner">${escape(error.message)}</p>`;
     }
   });
 }
 
-function renderObjectDataset() {
-  const region = $('#object-dataset-region');
-  if (region) region.innerHTML = objectDataset();
-  setText('object-dataset-count', String(objectTests.results.length));
-}
+async function openSupabaseModal() {
+  const cfg = getSupabaseConfig();
+  const statusLabels = {
+    connected: '<span class="status good">🟢 Terhubung ke Supabase Cloud</span>',
+    offline: '<span class="status waiting">🟡 Mode Lokal (Kredensial tersimpan)</span>',
+    unconfigured: '<span class="status">⚪ Belum Dikonfigurasi</span>',
+  };
 
-function startObjectTest(repeat = false) {
-  if (!serialSession) {
-    toast('Hubungkan ESP32 sebelum memulai pengujian objek.', true);
-    return;
-  }
-  objectTestStartedAt = Date.now();
-  objectDistances = [];
-  objectLastSequence = latestFrame?.sequence ?? null;
-  objectRecorded = false;
-  objectResult = null;
-  if (!repeat) {
-    objectActualCm = '';
-    for (const id of ['object-actual', 'object-actual-mobile']) {
-      const actual = document.getElementById(id);
-      if (actual) actual.value = '';
+  openModal('Pengaturan Database Supabase', 'Konfigurasi PostgreSQL Cloud untuk sinkronisasi multi-device & data wahana.', `<div class="form-grid">
+    <div class="db-settings-status" id="db-status-box">Status saat ini: ${statusLabels[supabaseStatus] || statusLabels.unconfigured}</div>
+    ${cfg.fromEnv ? '<div class="notice" style="margin-bottom:12px;"><strong>Konfigurasi Otomatis:</strong> Kredensial saat ini dimuat langsung dari file <code>.env</code>.</div>' : ''}
+    <div id="db-form-error" role="alert"></div>
+    <div class="field">
+      <label for="sb-url">Supabase Project URL <span class="req">*</span></label>
+      <input id="sb-url" type="url" placeholder="https://xyzcompany.supabase.co" value="${escape(cfg.url)}">
+      <p class="field-help">Dapat dilihat di Dashboard Supabase → Project Settings → API.</p>
+    </div>
+    <div class="field">
+      <label for="sb-key">Supabase Anon Public Key <span class="req">*</span></label>
+      <input id="sb-key" type="password" placeholder="eyJhbGciOiJIUzI1NiIsIn..." value="${escape(cfg.anonKey)}">
+      <p class="field-help">Kunci publik anonim (aman digunakan di browser client).</p>
+    </div>
+    <div class="modal-actions" style="margin-top:10px;">
+      <button type="button" class="btn" id="btn-test-db">Tes Koneksi</button>
+      <button type="button" class="btn" id="btn-sync-local">Sinkronkan Data Lokal ke Cloud</button>
+      <button type="button" class="btn primary" id="btn-save-db">Simpan Pengaturan</button>
+    </div>
+    <div class="db-quick-guide">
+      <strong>Catatan Setup:</strong> Pastikan tabel <code>members</code>, <code>rides</code>, dan <code>ride_validations</code> sudah dibuat menggunakan file <code>cocomang/supabase/schema.sql</code> di Supabase SQL Editor.
+    </div>
+  </div>`);
+
+  $('#btn-test-db')?.addEventListener('click', async () => {
+    const url = $('#sb-url').value.trim();
+    const key = $('#sb-key').value.trim();
+    if (!url || !key) {
+      $('#db-form-error').innerHTML = '<p class="error-banner">Masukkan Project URL dan Anon Key terlebih dahulu.</p>';
+      return;
     }
-  }
-  updateObjectUI();
-  toast(repeat ? 'Pengujian objek diulang. Buffer sampel dimulai dari awal.' : 'Pengujian objek dimulai. Arahkan objek ke sensor.');
-}
-
-function resetObjectTest() {
-  objectTestStartedAt = 0;
-  objectDistances = [];
-  objectLastSequence = null;
-  objectRecorded = false;
-  objectResult = null;
-  objectTargetCm = '';
-  objectActualCm = '';
-  const target = $('#object-target');
-  if (target) target.value = '';
-  for (const id of ['object-actual', 'object-actual-mobile']) {
-    const actual = document.getElementById(id);
-    if (actual) actual.value = '';
-  }
-  updateObjectUI();
-  toast('Pengujian objek direset.');
-}
-
-function recordObjectTest() {
-  const capture = objectCaptureState();
-  if (!capture.ready) throw new Error(capture.label);
-  if (!objectResult) throw new Error('Belum ada hasil pengujian untuk dicatat.');
-  const latestValid = latestFrame?.status === 'ok' ? latestFrame : null;
-  const record = createObjectTestResult({
-    targetDistanceCm: Number(objectTargetCm),
-    actualDistanceCm: Number(objectActualCm),
-    measuredDistanceCm: objectResult.measuredDistanceCm,
-    detectionStatus: objectResult.detectionStatus,
-    stabilityStatus: objectResult.status,
-    stabilityRangeCm: objectResult.stabilityRangeCm,
-    sampleCount: objectResult.sampleCount,
-    durationMs: Date.now() - objectTestStartedAt,
-    targetMinCm: objectSettings.minCm,
-    targetMaxCm: objectSettings.maxCm,
-    toleranceCm: objectSettings.toleranceCm,
-    sequence: latestValid?.sequence ?? null,
-    calibrated: latestValid ? Boolean(latestValid.calibrated) : null,
-    direction: objectDirection,
+    $('#db-status-box').innerHTML = 'Menguji koneksi ke Supabase…';
+    const result = await testSupabaseConnection(url, key);
+    if (result.success) {
+      $('#db-form-error').innerHTML = '';
+      $('#db-status-box').innerHTML = '<span class="status good">🟢 Sukses: Terhubung ke database Supabase!</span>';
+    } else {
+      $('#db-form-error').innerHTML = `<p class="error-banner">${escape(result.message)}</p>`;
+      $('#db-status-box').innerHTML = '<span class="status alarm">🔴 Gagal menghubungi Supabase</span>';
+    }
   });
-  objectTests = appendObjectTest(record);
-  objectRecorded = true;
-  renderObjectDataset();
-  updateObjectUI();
-  toast(record.errorCm == null ? 'Snapshot pengujian objek dicatat.' : `Snapshot dicatat; error ${fmtSigned(record.errorCm)} cm.`);
+
+  $('#btn-save-db')?.addEventListener('click', async () => {
+    const url = $('#sb-url').value.trim();
+    const key = $('#sb-key').value.trim();
+    saveSupabaseConfig({ url, anonKey: key });
+    if (url && key) {
+      const test = await testSupabaseConnection(url, key);
+      supabaseStatus = test.success ? 'connected' : 'offline';
+      if (test.success) {
+        await initCloudData();
+      }
+    } else {
+      supabaseStatus = 'unconfigured';
+    }
+    modal.close();
+    render();
+    toast(supabaseStatus === 'connected' ? 'Pengaturan Supabase disimpan & terhubung!' : 'Pengaturan disimpan (Mode Lokal).');
+  });
+
+  $('#btn-sync-local')?.addEventListener('click', async () => {
+    if (supabaseStatus !== 'connected') {
+      toast('Hubungkan Supabase terlebih dahulu sebelum sinkronisasi.', true);
+      return;
+    }
+    const res = await syncLocalMembersToSupabase(state.visitors);
+    if (res.synced > 0) {
+      toast(`${res.synced} data member berhasil diunggah ke Supabase!`);
+    } else {
+      toast('Tidak ada data baru untuk disinkronkan.');
+    }
+  });
 }
 
-function exportObjectTestsCsv() {
-  if (!objectTests.results.length) {
-    toast('Belum ada hasil pengujian objek untuk diekspor.', true);
-    return;
-  }
-  download('cocomang-dataset-deteksi-objek.csv', objectTestsCsv(objectTests.results), 'text/csv;charset=utf-8');
-}
-
-function applyObjectRangeSettings() {
-  const minCm = Number($('#object-min')?.value);
-  const maxCm = Number($('#object-max')?.value);
-  const issue = validateObjectRange({ minCm, maxCm });
-  if (issue) {
-    const minInput = $('#object-min');
-    const maxInput = $('#object-max');
-    if (minInput) minInput.value = String(objectSettings.minCm);
-    if (maxInput) maxInput.value = String(objectSettings.maxCm);
-    toast(`${issue} Pengaturan sebelumnya tetap dipakai.`, true);
-    return;
-  }
-  if (minCm === objectSettings.minCm && maxCm === objectSettings.maxCm) return;
-  objectSettings = { ...objectSettings, minCm, maxCm };
-  objectDistances = [];
-  objectLastSequence = latestFrame?.sequence ?? null;
-  objectRecorded = false;
-  if (objectTestStartedAt) objectTestStartedAt = Date.now();
-  updateObjectUI();
-}
-
-function saveLiveReading() {
+async function saveLiveReading() {
   if (!serialSession) throw new Error('ESP32 belum terhubung.');
   if (!latestFrame || latestFrame.status !== 'ok') throw new Error('Belum ada pembacaan live yang valid dari ESP32.');
   if (!lastFrameAt || Date.now() - lastFrameAt > 3000) throw new Error('Data sensor sudah kedaluwarsa. Tunggu pembacaan live berikutnya.');
-  if (!selectedVisitorId) throw new Error('Pilih pengunjung terlebih dahulu.');
+  if (!selectedVisitorId) throw new Error('Pilih member terlebih dahulu.');
   if (latestFrame.sequence != null && latestFrame.sequence === lastSavedSequence) throw new Error('Pembacaan ini sudah disimpan. Tunggu data live berikutnya.');
   let entry;
   commit(next => { entry = recordMeasurement(next, selectedVisitorId, latestFrame); });
   lastSavedSequence = latestFrame.sequence;
   toast(`Hasil ${fmt(entry.heightCm)} cm tersimpan untuk ${entry.visitorName}.`);
+
+  // Update tinggi member di Supabase
+  const member = state.visitors.find(m => m.id === selectedVisitorId);
+  if (member?.rfidUid && supabaseStatus === 'connected') {
+    void updateSupabaseMemberHeight(member.rfidUid, entry.heightCm, entry.capturedAt);
+  }
+
   render();
 }
 
@@ -1078,10 +850,15 @@ function exportMeasurementsCsv() {
     return;
   }
   const data = rows.map(row => ({
-    'Waktu WIB': when(row.capturedAt), 'Pengunjung': row.visitorName,
-    'Tinggi (cm)': row.heightCm, 'Jarak sensor (cm)': row.distanceCm,
-    'Tinggi referensi (cm)': row.referenceHeightCm, 'Offset (cm)': row.offsetCm,
-    'Sampel valid': `${row.validSamples}/5`, 'Status pengukuran': row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Normal',
+    'Waktu WIB': when(row.capturedAt),
+    'Member': row.visitorName,
+    'UID RFID': row.memberRfid || '—',
+    'Tinggi (cm)': row.heightCm,
+    'Jarak sensor (cm)': row.distanceCm,
+    'Tinggi referensi (cm)': row.referenceHeightCm,
+    'Offset (cm)': row.offsetCm,
+    'Sampel valid': `${row.validSamples}/5`,
+    'Status pengukuran': row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Normal',
     'Kalibrasi': row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi',
   }));
   download('cocomang-riwayat-pengukuran.csv', csvExport(data), 'text/csv;charset=utf-8');
@@ -1109,23 +886,22 @@ function printPdfReport() {
     historyStatus !== 'all' ? `Status ${historyStatus === 'alarm' ? 'ambang buzzer aktif' : 'normal'}` : '',
     historyCalibration !== 'all' ? `Kalibrasi ${historyCalibration === 'confirmed' ? 'terkalibrasi' : 'belum terkalibrasi'}` : '',
   ].filter(Boolean).join(' · ');
-  const body = rows.map((row, index) => `<tr><td>${index + 1}</td><td>${escape(when(row.capturedAt))}</td><td>${escape(row.visitorName)}</td><td>${fmt(row.heightCm)}</td><td>${fmt(row.distanceCm)}</td><td>${row.buzzerAlarm ? 'Ambang &lt; 100 cm' : 'Normal'}</td><td>${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</td></tr>`).join('');
+  const body = rows.map((row, index) => `<tr><td>${index + 1}</td><td>${escape(when(row.capturedAt))}</td><td>${escape(row.visitorName)}</td><td><code class="rfid-badge">${escape(row.memberRfid || '—')}</code></td><td>${fmt(row.heightCm)}</td><td>${fmt(row.distanceCm)}</td><td>${row.buzzerAlarm ? 'Ambang &lt; 100 cm' : 'Normal'}</td><td>${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</td></tr>`).join('');
   printWindow.document.write(`<!doctype html><html lang="id"><head><meta charset="utf-8"><title>Laporan Pengukuran COCOMANG</title><style>
-    @page{size:A4;margin:16mm}*{box-sizing:border-box}body{font:11px Arial,sans-serif;color:#243c32;margin:0}h1{font-family:Georgia,serif;font-size:22px;font-weight:600;margin:2px 0 4px}p{color:#59675d;line-height:1.5;margin:0}.brandline{display:flex;align-items:baseline;gap:10px;border-top:3px solid #254b3e;padding-top:12px}.brandline strong{font-size:16px;letter-spacing:.08em}.brandline span{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#59675d}.meta{border-bottom:1px solid #b9c1ad;padding-bottom:12px;margin-bottom:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0}.summary div{border:1px solid #cbd3c5;padding:9px 10px}.summary span{display:block;color:#59675d;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.summary strong{display:block;font-size:17px;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #cbd3c5;padding:7px 6px;text-align:left;font-size:9px}th{background:#eef0e7;font-size:8px;text-transform:uppercase;letter-spacing:.05em}td:nth-child(1),td:nth-child(4),td:nth-child(5){font-variant-numeric:tabular-nums}.foot{margin-top:18px;font-size:9px;color:#657064;border-top:1px solid #cbd3c5;padding-top:8px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui Web Serial</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Pengunjung</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
+    @page{size:A4;margin:16mm}*{box-sizing:border-box}body{font:11px Arial,sans-serif;color:#243c32;margin:0}h1{font-family:Georgia,serif;font-size:22px;font-weight:600;margin:2px 0 4px}p{color:#59675d;line-height:1.5;margin:0}.brandline{display:flex;align-items:baseline;gap:10px;border-top:3px solid #254b3e;padding-top:12px}.brandline strong{font-size:16px;letter-spacing:.08em}.brandline span{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#59675d}.meta{border-bottom:1px solid #b9c1ad;padding-bottom:12px;margin-bottom:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0}.summary div{border:1px solid #cbd3c5;padding:9px 10px}.summary span{display:block;color:#59675d;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.summary strong{display:block;font-size:17px;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #cbd3c5;padding:7px 6px;text-align:left;font-size:9px}th{background:#eef0e7;font-size:8px;text-transform:uppercase;letter-spacing:.05em}td:nth-child(1),td:nth-child(5),td:nth-child(6){font-variant-numeric:tabular-nums}.rfid-badge{display:inline-block;padding:1px 5px;font-family:monospace;font-size:8.5px;background:#eef0e7;border:1px solid #cbd3c5;border-radius:3px}.foot{margin-top:18px;font-size:9px;color:#657064;border-top:1px solid #cbd3c5;padding-top:8px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan Member</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui Web Serial</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Member</th><th>UID RFID</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
   printWindow.document.close();
 }
 
 function showHelp() {
-  openModal('Petunjuk perangkat', 'Koneksi, kalibrasi, dan batas integrasi COCOMANG SmartHeight.', `<ul class="help-list">
-    <li>Gunakan Chrome atau Edge versi desktop.</li>
-    <li>Buka aplikasi melalui <strong>http://localhost:8000</strong> atau HTTPS. Jangan membuka file HTML langsung.</li>
-    <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32.</li>
-    <li>Pilih COM port ESP32 pada dialog browser. Baud rate firmware 115200.</li>
-    <li>HC-SR04 dipasang menghadap ke bawah. Firmware menghitung <code>tinggi = Href − (jarak + offset)</code>.</li>
-    <li>Buzzer pada GPIO 27 dikendalikan firmware saat tinggi di bawah 100 cm. Website hanya menampilkan statusnya.</li>
-    <li>Data hanya disimpan saat petugas menekan Simpan hasil live. Data tersimpan di peramban ini, bukan cloud.</li>
-    </ul><div class="notice">Pembacaan adalah estimasi prototipe. Verifikasi reference height, offset, dan posisi sensor secara fisik sebelum menyimpulkan akurasi.</div><div class="modal-actions"><button class="btn primary" data-action="close-modal">Mengerti</button></div>`);
+  openModal('Petunjuk perangkat & Supabase', 'Koneksi, Dual RFID, dan integrasi cloud COCOMANG.', `<ul class="help-list">
+    <li>Gunakan Chrome atau Edge versi desktop melalui <strong>http://localhost:8000</strong> atau HTTPS.</li>
+    <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32. Baud rate 115200.</li>
+    <li><strong>Dual RFID:</strong> Reader 1 untuk pendaftaran member baru, Reader 2 untuk validasi akses wahana.</li>
+    <li><strong>Buzzer Pasif:</strong> Menghasilkan 1x bip saat lolos syarat wahana, dan 3x bip saat tinggi badan kurang.</li>
+    <li><strong>Supabase PostgreSQL:</strong> Klik tombol status Supabase di header untuk mengisi URL & Anon Key.</li>
+    <li>Data tetap aman tersimpan lokal di browser meskipun tidak ada koneksi internet.</li>
+    </ul><div class="modal-actions"><button class="btn primary" data-action="close-modal">Mengerti</button></div>`);
 }
 
 function bindPage() {
@@ -1133,94 +909,68 @@ function bindPage() {
     selectedVisitorId = event.target.value;
     updateConnectionUI();
   });
+  $('#ride-selector')?.addEventListener('change', event => {
+    selectedRideId = event.target.value;
+  });
   $('#history-from')?.addEventListener('change', event => { historyFrom = event.target.value; renderHistoryTable(); });
   $('#history-to')?.addEventListener('change', event => { historyTo = event.target.value; renderHistoryTable(); });
   $('#history-search')?.addEventListener('input', event => { historySearch = event.target.value; renderHistoryTable(); });
   $('#history-status')?.addEventListener('change', event => { historyStatus = event.target.value; renderHistoryTable(); });
   $('#history-calibration')?.addEventListener('change', event => { historyCalibration = event.target.value; renderHistoryTable(); });
   $('#history-sort')?.addEventListener('change', event => { historySort = event.target.value; renderHistoryTable(); });
-  $('#object-target')?.addEventListener('input', event => { objectTargetCm = event.target.value; updateObjectUI(); });
-  for (const id of ['object-actual', 'object-actual-mobile']) {
-    document.getElementById(id)?.addEventListener('input', event => {
-      objectActualCm = event.target.value;
-      for (const otherId of ['object-actual', 'object-actual-mobile']) {
-        const other = document.getElementById(otherId);
-        if (other && other.value !== objectActualCm) other.value = objectActualCm;
-      }
-      updateObjectUI();
-    });
-  }
-  $('#object-min')?.addEventListener('change', applyObjectRangeSettings);
-  $('#object-max')?.addEventListener('change', applyObjectRangeSettings);
 }
 
 document.addEventListener('click', event => {
   const button = event.target.closest('[data-action]');
   if (!button || button.disabled) return;
   const action = button.dataset.action;
-  if (action === 'add-visitor') visitorForm();
+  if (action === 'add-member' || action === 'add-visitor') memberForm();
+  else if (action === 'delete-member') {
+    const id = button.dataset.id;
+    const name = button.dataset.name || 'Member';
+    const rfid = button.dataset.rfid;
+    if (!confirm(`Hapus member "${name}"${rfid ? ` (${rfid})` : ''}?\nData member akan dihapus secara permanen dari sistem.`)) return;
+
+    try {
+      commit(next => { deleteMember(next, id); });
+      if (selectedVisitorId === id) selectedVisitorId = '';
+      if (rfid && supabaseStatus === 'connected') {
+        void deleteMemberFromSupabase(rfid);
+      }
+      render();
+      toast(`Member "${name}" berhasil dihapus.`);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
   else if (action === 'connect') void connectDevice();
   else if (action === 'disconnect') void disconnectDevice();
   else if (action === 'save-reading') {
-    try { saveLiveReading(); } catch (error) { toast(error.message, true); }
+    try { void saveLiveReading(); } catch (error) { toast(error.message, true); }
   }
+  else if (action === 'manual-validate') {
+    const member = state.visitors.find(m => m.id === selectedVisitorId);
+    if (!member) {
+      toast('Pilih member terlebih dahulu untuk divalidasi.', true);
+      return;
+    }
+    void handleRideValidation(member, 2);
+  }
+  else if (action === 'open-db-settings') void openSupabaseModal();
   else if (action === 'export-csv') exportMeasurementsCsv();
   else if (action === 'print-pdf') printPdfReport();
   else if (action === 'clear-filter') { historyFrom = ''; historyTo = ''; historySearch = ''; historyStatus = 'all'; historyCalibration = 'all'; historySort = 'newest'; render(); }
-  else if (action === 'measurement-mode' && (button.dataset.mode === 'height' || button.dataset.mode === 'object')) {
-    if (measurementMode !== button.dataset.mode) {
-      objectDistances = [];
-      objectLastSequence = latestFrame?.sequence ?? null;
-      objectResult = null;
-      if (objectTestStartedAt) objectTestStartedAt = Date.now();
-      measurementMode = button.dataset.mode;
-      render();
-    }
-  }
-  else if (action === 'object-preset') {
-    objectTargetCm = button.dataset.cm || '';
-    const target = $('#object-target');
-    if (target) target.value = objectTargetCm;
-    updateObjectUI();
-  }
-  else if (action === 'object-direction') {
-    const newDir = normalizeObjectDirection(button.dataset.direction);
-    if (newDir !== objectDirection) {
-      objectDirection = newDir;
-      objectDistances = [];
-      objectLastSequence = latestFrame?.sequence ?? null;
-      objectResult = null;
-      objectRecorded = false;
-      if (objectTestStartedAt) objectTestStartedAt = Date.now();
-      render();
-      toast(`Arah pengujian: ${objectDirectionMeta(objectDirection).label} (${objectDirectionMeta(objectDirection).axisCode}). Sesuaikan orientasi fisik sensor secara manual.`);
-    }
-  }
-  else if (action === 'object-start') startObjectTest(false);
-  else if (action === 'object-repeat') startObjectTest(true);
-  else if (action === 'object-reset') resetObjectTest();
-  else if (action === 'object-record') {
-    try { recordObjectTest(); } catch (error) { toast(error.message, true); }
-  }
-  else if (action === 'export-object-csv') exportObjectTestsCsv();
   else if (action === 'help') showHelp();
   else if (action === 'close-modal') modal.close();
 });
 
-document.querySelector('.skip-link').addEventListener('click', event => {
+document.querySelector('.skip-link')?.addEventListener('click', event => {
   event.preventDefault();
   $('#main')?.focus();
 });
 
 window.addEventListener('hashchange', () => {
-  const next = location.hash.slice(1);
-  route = navs.some(item => item[0] === next) ? next : 'ringkasan';
-  if (measurementMode === 'object') {
-    objectDistances = [];
-    objectLastSequence = latestFrame?.sequence ?? null;
-    objectResult = null;
-    if (objectTestStartedAt) objectTestStartedAt = Date.now();
-  }
+  route = normalizeRoute(location.hash);
   if (state) render();
 });
 
@@ -1229,34 +979,77 @@ window.addEventListener('storage', event => {
     try { state = repository.load(); render(); toast('Data pengukuran diperbarui dari tab lain.'); }
     catch (error) { toast(error.message, true); }
   }
-  if (event.key === OBJECT_TESTS_STORAGE_KEY) {
-    try {
-      objectTests = loadObjectTests();
-      if (route === 'pengukuran' && measurementMode === 'object') {
-        renderObjectDataset();
-        updateObjectUI();
-      }
-      toast('Dataset pengujian objek diperbarui dari tab lain.');
-    } catch (error) { toast(error.message, true); }
-  }
 });
 
 setInterval(() => {
   if (serialSession) updateConnectionUI();
 }, 1000);
 
-function boot() {
+async function initCloudData() {
+  if (!isSupabaseConfigured()) return;
+  try {
+    const rides = await fetchSupabaseRides();
+    if (rides?.length) activeRides = rides;
+
+    const remoteMembers = await fetchSupabaseMembers();
+    if (remoteMembers?.length) {
+      // Sinkronkan remote member ke local repository jika belum ada
+      commit(next => {
+        for (const rm of remoteMembers) {
+          if (!next.visitors.some(local => local.rfidUid && normalizeRfid(local.rfidUid) === normalizeRfid(rm.rfidUid))) {
+            next.visitors.push(rm);
+          }
+        }
+      });
+    }
+
+    void subscribeToRealtime({
+      onMemberChange: () => {
+        toast('Data member diperbarui dari Supabase Realtime.');
+        void fetchSupabaseMembers().then(updated => {
+          if (updated?.length) {
+            commit(next => {
+              for (const rm of updated) {
+                const idx = next.visitors.findIndex(local => local.rfidUid && normalizeRfid(local.rfidUid) === normalizeRfid(rm.rfidUid));
+                if (idx >= 0) next.visitors[idx] = rm;
+                else next.visitors.push(rm);
+              }
+            });
+            render();
+          }
+        });
+      },
+      onValidationChange: payload => {
+        if (payload?.new) {
+          const val = payload.new;
+          toast(`[Realtime Wahana] ${val.member_name}: ${val.is_eligible ? 'Lolos' : 'Ditolak'} (${val.ride_name})`);
+        }
+      },
+    });
+  } catch (err) {
+    console.warn('initCloudData error:', err);
+  }
+}
+
+async function boot() {
   try {
     state = repository.load();
-    let objectLoadError = '';
-    try { objectTests = loadObjectTests(); }
-    catch (error) {
-      objectTests = createEmptyObjectTests();
-      objectLoadError = error.message;
+    route = normalizeRoute(location.hash);
+
+    await loadEnvConfig();
+
+    if (isSupabaseConfigured()) {
+      const cfg = getSupabaseConfig();
+      const test = await testSupabaseConnection(cfg.url, cfg.anonKey);
+      supabaseStatus = test.success ? 'connected' : 'offline';
+      if (test.success) {
+        await initCloudData();
+      }
+    } else {
+      supabaseStatus = 'unconfigured';
     }
-    route = navs.some(item => item[0] === route) ? route : 'ringkasan';
+
     render();
-    if (objectLoadError) toast(objectLoadError, true);
   } catch (error) {
     $('#app').innerHTML = `<main class="boot"><div><h1>Data belum dapat dibuka</h1><p>${escape(error.message)}</p></div></main>`;
   }
