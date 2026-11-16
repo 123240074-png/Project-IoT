@@ -282,9 +282,12 @@
           <strong>Kiosk Mandiri (RFID 2)</strong>
         </div>
         <div class="operator">
-          <span class="mode-label">Serial 115200</span>
-          <button class="pill offline" id="serialStatusPill" style="cursor: pointer; border: 1px solid var(--line);" title="Klik untuk hubungkan / putuskan USB Serial ESP32 (115200 baud)">
-            <i></i><span>ESP32 terputus</span>
+          <span class="mode-label">MQTT Cloud</span>
+          <button class="cloud-pill connected" id="mqttBrokerPill" style="cursor: pointer; border: none;" title="Pengaturan MQTT Broker">
+            <i></i><span>Broker Online</span>
+          </button>
+          <button class="pill offline" id="espDevicePill" style="cursor: pointer; border: 1px solid var(--line);" title="Status ESP32">
+            <i></i><span>ESP32 Standby</span>
           </button>
           <span class="cloud-pill connected" id="cloudPill" title="Status Database Supabase"><i></i>Kiosk Mandiri</span>
         </div>
@@ -376,9 +379,9 @@
             Silakan dekatkan kartu pada sensor <strong>Reader 2 (Akses Masuk Wahana)</strong>. Buzzer ESP32 akan berbunyi 1x bip jika lolos syarat, atau 3x bip jika tidak memenuhi syarat wahana.
           </p>
 
-          <!-- Status Koneksi Serial Info -->
-          <div id="serialNoticeBox" style="margin-bottom: 16px; font-size: 12px; color: var(--muted); background: var(--surface-muted); padding: 8px 16px; border: 1px solid var(--line); border-radius: var(--radius); max-width: 560px;">
-            <span id="serialNoticeText">ESP32 belum terhubung. Klik status <strong>ESP32 terputus</strong> di header untuk menghubungkan Web Serial 115200.</span>
+          <!-- Status Koneksi MQTT Info -->
+          <div id="mqttNoticeBox" style="margin-bottom: 16px; font-size: 12px; color: var(--muted); background: var(--surface-muted); padding: 8px 16px; border: 1px solid var(--line); border-radius: var(--radius); max-width: 560px;">
+            <span id="mqttNoticeText">Menghubungkan ke Cloud Broker MQTT…</span>
           </div>
 
           <!-- Input Tersembunyi untuk Keyboard-Wedge Scanner -->
@@ -400,7 +403,7 @@
           <strong>COCOMANG</strong>
           <span>Smart Height Measurement System • Alur Loket: Pilih Wahana → Tap Kartu RFID 2.</span>
         </div>
-        <span style="font-size: 11.5px; color: var(--muted);">Buzzer Hardware Only • Serial 115200 baud</span>
+        <span style="font-size: 11.5px; color: var(--muted);">Buzzer Hardware Only • MQTT over WebSockets</span>
       </footer>
     </div>
   </div>
@@ -484,20 +487,60 @@
     </div>
   </dialog>
 
+  <!-- DIALOG 3: Pengaturan MQTT Broker -->
+  <dialog id="mqttModal" aria-labelledby="mqttModalTitle" style="padding: 24px; border: 1px solid var(--line); border-radius: var(--radius); max-width: 480px; width: 90%; background: var(--paper);">
+    <div class="modal-head">
+      <div>
+        <h2 id="mqttModalTitle" style="margin: 0; font-size: 18px; color: var(--green-deep);">Pengaturan MQTT Cloud Broker</h2>
+        <p style="font-size: 12px; color: var(--muted); margin-top: 4px;">Konfigurasi koneksi WebSocket nirkabel ke ESP32</p>
+      </div>
+    </div>
+    <form id="kioskMqttForm" style="display: flex; flex-direction: column; gap: 12px; margin-top: 14px;">
+      <div>
+        <label style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Broker Host (WebSocket)</label>
+        <input id="kioskMqttHost" style="width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 4px;" required placeholder="broker.emqx.io" />
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <div style="flex: 1;">
+          <label style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Port WSS</label>
+          <input id="kioskMqttPort" type="number" style="width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 4px;" required placeholder="8084" />
+        </div>
+        <div style="flex: 1;">
+          <label style="font-size: 12px; font-weight: 600; display: block; margin-bottom: 4px;">Topic Prefix</label>
+          <input id="kioskMqttPrefix" style="width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 4px;" required placeholder="cocomang" />
+        </div>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px;">
+        <button type="button" class="btn" id="btnCloseMqttModal">Batal</button>
+        <button type="submit" class="btn primary">Simpan & Sambungkan</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Toast Notification -->
   <div id="toast" role="status" aria-live="polite"></div>
 
-  <!-- Script Logika Alur Loket & Serial 115200 -->
+  <!-- Script Logika Alur Loket & MQTT -->
   <script type="module">
     import { lookupMember, getActiveRides, evaluateRideEligibility, bookRideTicket, recordValidationAttempt } from './kiosk-service.mjs';
-    import { parseRfidLine } from './serial-protocol.mjs';
+    import {
+      connectMqtt,
+      disconnectMqtt,
+      onMqttConnection,
+      onRfidReader2,
+      onDeviceStatusChange,
+      sendBuzzerCommand,
+      getMqttConfig,
+      saveMqttConfig,
+      getConnectionState,
+      getDeviceStatus,
+    } from './mqtt-service.mjs';
 
     // State Aplikasi Kiosk
     let availableRides = [];
     let selectedRide = null;
     let countdownInterval = null;
     let countdownSec = 30;
-    let serialSession = null;
 
     const toastEl = document.getElementById('toast');
     function showToast(message, isError = false) {
@@ -516,123 +559,97 @@
     });
 
     // =========================================================================
-    // FITUR PAIR / KONEKSI WEB SERIAL 115200 BAUD (ESP32)
+    // KONEKSI MQTT CLOUD BROKER
     // =========================================================================
-    const serialStatusPill = document.getElementById('serialStatusPill');
-    const serialNoticeText = document.getElementById('serialNoticeText');
+    const mqttBrokerPill = document.getElementById('mqttBrokerPill');
+    const espDevicePill = document.getElementById('espDevicePill');
+    const mqttNoticeText = document.getElementById('mqttNoticeText');
 
-    function updateSerialUI() {
-      if (serialSession) {
-        serialStatusPill.className = 'pill online';
-        serialStatusPill.innerHTML = '<i></i><span>Serial 115200 Terhubung</span>';
-        serialNoticeText.innerHTML = 'ESP32 terhubung (115200 baud). <strong>Reader 2 (Akses Wahana)</strong> siap membaca tap kartu.';
+    function updateMqttUI() {
+      const conn = getConnectionState();
+      const dev = getDeviceStatus();
+      const cfg = getMqttConfig();
+
+      if (conn === 'connected') {
+        mqttBrokerPill.className = 'cloud-pill connected';
+        mqttBrokerPill.innerHTML = '<i></i><span>Broker Online</span>';
+        mqttBrokerPill.title = `Terhubung ke ${cfg.host}:${cfg.port} (${cfg.topicPrefix})`;
+      } else if (conn === 'connecting') {
+        mqttBrokerPill.className = 'cloud-pill offline';
+        mqttBrokerPill.innerHTML = '<i></i><span>Menghubungkan…</span>';
+        mqttBrokerPill.title = 'Menghubungkan ke broker…';
       } else {
-        serialStatusPill.className = 'pill offline';
-        serialStatusPill.innerHTML = '<i></i><span>ESP32 terputus</span>';
-        serialNoticeText.innerHTML = 'ESP32 belum terhubung. Klik status <strong>ESP32 terputus</strong> di header untuk menghubungkan Web Serial 115200.';
+        mqttBrokerPill.className = 'cloud-pill unconfigured';
+        mqttBrokerPill.innerHTML = '<i></i><span>Broker Terputus</span>';
+        mqttBrokerPill.title = 'Klik untuk membuka pengaturan MQTT';
+      }
+
+      if (dev === 'online') {
+        espDevicePill.className = 'pill online';
+        espDevicePill.innerHTML = '<i></i><span>ESP32 Online</span>';
+        espDevicePill.title = 'ESP32 aktif dan terhubung ke broker';
+      } else {
+        espDevicePill.className = 'pill waiting';
+        espDevicePill.innerHTML = '<i></i><span>ESP32 Standby</span>';
+        espDevicePill.title = 'ESP32 standby/menunggu sinyal LWT';
+      }
+
+      if (conn === 'connected') {
+        mqttNoticeText.innerHTML = `Terhubung ke Cloud Broker. <strong>Reader 2 (Akses Wahana)</strong> siap menerima tap kartu secara nirkabel.`;
+      } else {
+        mqttNoticeText.innerHTML = `Broker terputus. Klik <strong>Broker Online / Terputus</strong> di header untuk memeriksa pengaturan koneksi.`;
       }
     }
 
-    // Perintah audio HANYA dikirimkan ke hardware buzzer ESP32 ('b' = 1 bip, 'n' = 3 bip)
-    async function sendBuzzerCommand(char) {
-      if (!serialSession?.port?.writable) return;
-      try {
-        const writer = serialSession.port.writable.getWriter();
-        const encoder = new TextEncoder();
-        await writer.write(encoder.encode(char));
-        writer.releaseLock();
-      } catch (err) {
-        console.warn('Gagal mengirim perintah buzzer ke ESP32:', err);
-      }
-    }
+    // Dialog Pengaturan MQTT
+    const mqttModal = document.getElementById('mqttModal');
+    const kioskMqttForm = document.getElementById('kioskMqttForm');
+    const kioskMqttHost = document.getElementById('kioskMqttHost');
+    const kioskMqttPort = document.getElementById('kioskMqttPort');
+    const kioskMqttPrefix = document.getElementById('kioskMqttPrefix');
 
-    async function disconnectSerial() {
-      if (!serialSession) return;
-      serialSession.cancelled = true;
-      try {
-        if (serialSession.reader) {
-          await serialSession.reader.cancel();
-          serialSession.reader.releaseLock();
-        }
-        if (serialSession.port) {
-          await serialSession.port.close();
-        }
-      } catch (err) {
-        console.warn('Gagal menutup port serial dengan bersih:', err);
-      }
-      serialSession = null;
-      updateSerialUI();
-      showToast('Koneksi serial ke ESP32 diputuskan.');
-    }
+    mqttBrokerPill.addEventListener('click', () => {
+      const cfg = getMqttConfig();
+      kioskMqttHost.value = cfg.host;
+      kioskMqttPort.value = cfg.port;
+      kioskMqttPrefix.value = cfg.topicPrefix;
+      mqttModal.showModal();
+    });
 
-    async function connectSerial() {
-      if (!('serial' in navigator)) {
-        showToast('Web Serial API tidak didukung pada browser ini. Gunakan Google Chrome atau Microsoft Edge.', true);
-        return;
-      }
-      if (serialSession) {
-        await disconnectSerial();
-        return;
-      }
+    document.getElementById('btnCloseMqttModal').addEventListener('click', () => {
+      mqttModal.close();
+    });
 
-      try {
-        const port = await navigator.serial.requestPort();
-        await port.open({ baudRate: 115200 });
+    kioskMqttForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      saveMqttConfig({
+        host: kioskMqttHost.value.trim(),
+        port: Number(kioskMqttPort.value) || 8084,
+        topicPrefix: kioskMqttPrefix.value.trim(),
+      });
+      mqttModal.close();
+      showToast('Menghubungkan ke broker MQTT…');
+      connectMqtt();
+    });
 
-        const session = { port, reader: null, cancelled: false };
-        serialSession = session;
-        updateSerialUI();
-        showToast('ESP32 berhasil terhubung pada 115200 baud.');
+    // Event Listener MQTT
+    onMqttConnection(() => updateMqttUI());
+    onDeviceStatusChange(() => updateMqttUI());
 
-        const reader = port.readable.getReader();
-        session.reader = reader;
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (!session.cancelled) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let newlineIndex;
-          while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-            const line = buffer.slice(0, newlineIndex).trim();
-            buffer = buffer.slice(newlineIndex + 1);
-            if (line) handleSerialLine(line);
-          }
-        }
-      } catch (err) {
-        console.error('Error koneksi serial:', err);
-        if (err.name !== 'NotFoundError') {
-          showToast(`Gagal membuka port serial: ${err.message}`, true);
-        }
-        await disconnectSerial();
-      }
-    }
-
-    serialStatusPill.addEventListener('click', connectSerial);
-
-    // =========================================================================
-    // BATASAN: WEBSITE LOKET WAHANA HANYA MEMPROSES RFID 2
-    // =========================================================================
-    function handleSerialLine(line) {
-      const rfidEvent = parseRfidLine(line);
+    // Tangani Tap Kartu dari Reader 2 (Akses Wahana) via MQTT
+    onRfidReader2(rfidEvent => {
       if (rfidEvent?.uid) {
-        // Cek apakah berasal dari Reader 2
-        if (rfidEvent.reader !== 2) {
-          showToast(`[Abaikan Tap Reader ${rfidEvent.reader}] Loket Wahana hanya menerima tap dari RFID 2 (Akses Wahana). Tap kartu di Reader 2!`, true);
-          return;
-        }
-
-        // Jika belum memilih wahana, arahkan untuk memilih wahana dahulu
         if (!selectedRide) {
           showToast('Silakan pilih salah satu wahana terlebih dahulu sebelum menempelkan kartu!', true);
           return;
         }
-
         showToast(`Kartu RFID 2 terdeteksi: ${rfidEvent.uid} (${rfidEvent.label})`);
         processCardValidation(rfidEvent.uid);
       }
-    }
+    });
+
+    // Otomatis hubungkan ke MQTT saat halaman dimuat
+    connectMqtt();
 
     // =========================================================================
     // TAHAP 1: RENDER KATALOG & PEMILIHAN WAHANA
