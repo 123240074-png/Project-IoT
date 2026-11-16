@@ -163,7 +163,7 @@ function statusPill() {
   if (!live) {
     return `<button type="button" class="pill waiting" data-action="reconnect-mqtt" title="Broker terhubung, menunggu telemetri dari ESP32."><i></i><span>Menunggu data</span></button>`;
   }
-  return `<button type="button" class="pill online" data-action="open-mqtt-settings" title="Telemetri live diterima via MQTT. Klik untuk opsi koneksi."><i></i><span>Data live diterima</span></button>`;
+  return `<button type="button" class="pill online" data-action="open-mqtt-settings" title="ESP32 Live via MQTT. Klik untuk opsi koneksi."><i></i><span>ESP32 Live</span></button>`;
 }
 
 function cloudPill() {
@@ -477,7 +477,7 @@ function render() {
       <div class="masthead-inner">
         <a class="brand" href="#ringkasan"><span class="brand-name">COCOMANG</span><span class="brand-caption">Smart Height Measurement System</span></a>
         <div class="desk-identity"><span>Pos Ukur & Wahana</span><strong>ESP32 Dual RFID</strong></div>
-        <div class="operator"><span class="mode-label">MQTT Cloud</span>${mqttBrokerPill()}${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan sistem">${svg('info')}</button></div>
+        <div class="operator"><span class="mode-label">MQTT Cloud</span>${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan sistem">${svg('info')}</button></div>
       </div>
       <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}<a class="nav-link nav-link-wahana" href="./kiosk.html" style="margin-left: auto; color: var(--green); font-weight: 600;" title="Buka Loket Wahana (Kiosk Mandiri RFID 2)"><span>Buka Loket Wahana (Kiosk) →</span></a></nav>
     </header>
@@ -492,14 +492,14 @@ function render() {
 function updateConnectionUI() {
   const conn = getConnectionState();
   const live = isLive();
-  const stateText = conn !== 'connected' ? 'Offline' : live ? 'Data live diterima' : 'Menunggu data';
+  const stateText = conn !== 'connected' ? 'Offline' : live ? 'ESP32 Live' : 'Menunggu data';
   $$('.pill').forEach(element => {
     element.className = `pill ${conn !== 'connected' ? 'offline' : live ? 'online' : 'waiting'}`;
     element.innerHTML = `<i></i><span>${stateText}</span>`;
     element.title = conn !== 'connected'
       ? 'Broker MQTT terputus. Klik untuk membuka pengaturan broker.'
       : live
-        ? 'Data live diterima via MQTT. Klik untuk opsi koneksi.'
+        ? 'ESP32 Live via MQTT. Klik untuk opsi koneksi.'
         : 'Broker terhubung, menunggu data dari ESP32.';
     if (element.tagName === 'BUTTON') {
       element.dataset.action = 'open-mqtt-settings';
@@ -623,52 +623,19 @@ function openModal(title, subtitle, content) {
 
 function openMqttModal() {
   const cfg = getMqttConfig();
-  const conn = getConnectionState();
-  const labels = {
-    connected: '<span class="status good">🟢 Terhubung ke Broker Cloud</span>',
-    connecting: '<span class="status waiting">🟡 Sedang Menghubungkan…</span>',
-    disconnected: '<span class="status">⚪ Terputus</span>',
-    error: '<span class="status alarm">🔴 Gagal Terhubung</span>',
-  };
-
-  openModal('Pengaturan MQTT Cloud Broker', 'Konfigurasi broker MQTT over WebSockets untuk komunikasi nirkabel dengan ESP32.', `<form id="mqtt-form" class="form-grid">
-    <div class="db-settings-status">Status Broker: ${labels[conn] || labels.disconnected}</div>
-    <div id="mqtt-form-error" role="alert"></div>
+  openModal('Pengaturan MQTT Cloud Broker', 'Konfigurasi koneksi WebSocket nirkabel ke ESP32', `<form id="mqtt-form" class="form-grid">
     <div class="field">
       <label for="mqtt-host">Broker Host (WebSocket) <span class="req">*</span></label>
       <input id="mqtt-host" name="host" required placeholder="broker.emqx.io" value="${escape(cfg.host)}">
-      <p class="field-help">Default: <code>broker.emqx.io</code> (atau cluster HiveMQ Cloud Anda).</p>
     </div>
     <div class="field-row">
       <div class="field">
-        <label for="mqtt-port">Port WebSocket <span class="req">*</span></label>
+        <label for="mqtt-port">Port WSS <span class="req">*</span></label>
         <input id="mqtt-port" name="port" type="number" required placeholder="8084" value="${cfg.port}">
       </div>
       <div class="field">
-        <label for="mqtt-protocol">Protokol</label>
-        <select id="mqtt-protocol" name="protocol">
-          <option value="wss" ${cfg.protocol === 'wss' ? 'selected' : ''}>WSS (Secure WebSocket)</option>
-          <option value="ws" ${cfg.protocol === 'ws' ? 'selected' : ''}>WS (Plain WebSocket)</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="mqtt-path">WebSocket Path</label>
-        <input id="mqtt-path" name="path" placeholder="/mqtt" value="${escape(cfg.path)}">
-      </div>
-    </div>
-    <div class="field">
-      <label for="mqtt-prefix">Topic Prefix <span class="req">*</span></label>
-      <input id="mqtt-prefix" name="topicPrefix" required placeholder="cocomang" value="${escape(cfg.topicPrefix)}">
-      <p class="field-help">Harus sama dengan <code>MQTT_TOPIC_PREFIX</code> pada firmware ESP32 (contoh: <code>cocomang</code>).</p>
-    </div>
-    <div class="field-row">
-      <div class="field">
-        <label for="mqtt-user">Username (opsional)</label>
-        <input id="mqtt-user" name="username" placeholder="Kosongkan jika anonymous" value="${escape(cfg.username || '')}">
-      </div>
-      <div class="field">
-        <label for="mqtt-pass">Password (opsional)</label>
-        <input id="mqtt-pass" name="password" type="password" placeholder="Password broker" value="${escape(cfg.password || '')}">
+        <label for="mqtt-prefix">Topic Prefix <span class="req">*</span></label>
+        <input id="mqtt-prefix" name="topicPrefix" required placeholder="cocomang" value="${escape(cfg.topicPrefix)}">
       </div>
     </div>
     <div class="modal-actions">
@@ -680,11 +647,14 @@ function openMqttModal() {
   $('#mqtt-form')?.addEventListener('submit', event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
-    data.port = Number(data.port) || 8084;
-    saveMqttConfig(data);
+    saveMqttConfig({
+      host: data.host.trim(),
+      port: Number(data.port) || 8084,
+      topicPrefix: data.topicPrefix.trim(),
+    });
     modal.close();
     toast('Menghubungkan ke broker MQTT…');
-    connectMqtt(data);
+    connectMqtt();
   });
 }
 
@@ -819,16 +789,7 @@ function saveLiveReading() {
 
   let entry;
   commit(next => {
-    entry = recordMeasurement(next, {
-      visitorId: member.id,
-      visitorName: member.name,
-      memberRfid: member.rfidUid || '',
-      distanceCm: frame.distanceCm,
-      heightCm: frame.heightCm,
-      sequence: frame.sequence,
-      buzzerAlarm: frame.buzzerAlarm,
-      calibrated: frame.calibrated,
-    });
+    entry = recordMeasurement(next, member.id, frame);
   });
 
   lastSavedSequence = frame.sequence;
@@ -837,7 +798,13 @@ function saveLiveReading() {
 
   // Sinkronkan perubahan tinggi member ke Supabase Cloud
   if (supabaseStatus === 'connected' && member.rfidUid) {
-    void updateSupabaseMemberHeight(member.rfidUid, frame.heightCm, entry.capturedAt);
+    updateSupabaseMemberHeight(member.rfidUid, frame.heightCm, entry.capturedAt)
+      .then(synced => {
+        if (synced) toast(`Tinggi ${member.name} tersimpan ke Supabase Cloud.`);
+      })
+      .catch(err => {
+        console.error('Gagal sinkron tinggi ke Supabase:', err);
+      });
   }
 }
 

@@ -80,6 +80,21 @@ test('stores only validated live readings and updates selected visitor', () => {
   assert.equal(entry.calibrated, false);
 });
 
+test('supports recording measurement with single object payload containing visitorId', () => {
+  const state = createInitialState();
+  const visitor = addVisitor(state, { name: 'Member Uji 2' });
+  const entry = recordMeasurement(state, {
+    visitorId: visitor.id,
+    distanceCm: 50.0,
+    heightCm: 170.0,
+    sequence: 3,
+  });
+  assert.equal(entry.heightCm, 170.0);
+  assert.equal(entry.distanceCm, 50.0);
+  assert.equal(visitor.heightCm, 170.0);
+  assert.equal(state.measurements.length, 1);
+});
+
 test('rejects a bad frame, invalid visitor, or missing selected visitor', () => {
   const state = createInitialState();
   const visitor = addVisitor(state, { name: 'Member Uji' });

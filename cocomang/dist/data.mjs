@@ -132,7 +132,28 @@ export function validateDeviceFrame(frame) {
   return null;
 }
 
-export function recordMeasurement(state, visitorId, frame, now = new Date().toISOString()) {
+export function recordMeasurement(state, visitorIdOrPayload, maybeFrame, now = new Date().toISOString()) {
+  let visitorId = visitorIdOrPayload;
+  let frame = maybeFrame;
+  let timestamp = now;
+
+  // Mendukung format pemanggilan objek tunggal: recordMeasurement(state, { visitorId, ...frame })
+  if (typeof visitorIdOrPayload === 'object' && visitorIdOrPayload !== null && !maybeFrame) {
+    visitorId = visitorIdOrPayload.visitorId;
+    frame = {
+      device: 'smartheight-esp32',
+      type: 'measurement',
+      status: 'ok',
+      referenceHeightCm: 220,
+      offsetCm: 0,
+      validSamples: 5,
+      buzzerAlarm: false,
+      calibrated: false,
+      ...visitorIdOrPayload,
+    };
+    if (visitorIdOrPayload.capturedAt) timestamp = visitorIdOrPayload.capturedAt;
+  }
+
   const issue = validateDeviceFrame(frame);
   if (issue) throw new Error(issue);
   const visitor = state.visitors.find(item => item.id === visitorId);
@@ -152,11 +173,11 @@ export function recordMeasurement(state, visitorId, frame, now = new Date().toIS
     calibrated: Boolean(frame.calibrated),
     device: frame.device,
     sequence: Number.isInteger(frame.sequence) ? frame.sequence : null,
-    capturedAt: now,
+    capturedAt: timestamp,
   };
 
   visitor.heightCm = entry.heightCm;
-  visitor.measuredAt = now;
+  visitor.measuredAt = timestamp;
   state.measurements.unshift(entry);
   return entry;
 }
