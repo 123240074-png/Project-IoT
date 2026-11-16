@@ -282,7 +282,7 @@ function dashboardPage() {
       </div>
       ${previous.length ? `<ul class="latest-list" aria-label="Pengukuran sebelumnya">${previous.map(row => `<li class="latest-row"><div><span class="latest-row-name">${escape(row.visitorName)}</span><span class="latest-row-time">${when(row.capturedAt)}</span></div><span class="latest-row-value">${fmt(row.heightCm)} cm</span></li>`).join('')}</ul>` : ''}`
     : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Koneksi MQTT aktif, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
-  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('mqtt')} Buka pengukuran live</a>`)
+  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.')
     + `<section class="summary-strip" aria-label="Ringkasan operasional">
         ${summaryCell('Member', state.visitors.length, 'orang', `${measuredMembers} sudah diukur`)}
         ${summaryCell('Sudah diukur', measuredMembers, 'orang', 'Memiliki hasil sensor')}
@@ -450,17 +450,7 @@ function historyMeta(rows) {
 function historyPage() {
   const rows = filteredMeasurements();
   return header('Ledger riwayat pengukuran', 'Audit menyeluruh pembacaan sensor ultrasonik, UID kartu RFID, dan catatan kalibrasi perangkat.', `<button class="btn" data-action="export-csv">${svg('download')} Ekspor CSV</button><button class="btn" data-action="print-pdf">${svg('printer')} Cetak laporan</button>`)
-    + `<section class="panel"><div class="panel-header"><div><h2>Data pengukuran tersimpan <span class="count" id="history-count">${rows.length}</span></h2><p id="history-result-meta">${historyMeta(rows)}</p></div><button class="text-button" data-action="clear-filter">Reset filter</button></div>
-        <div class="filter-strip" aria-label="Filter ledger pengukuran">
-          <div class="field"><label for="history-search">Pencarian member atau UID</label><input id="history-search" value="${escape(historySearch)}" placeholder="Cari nama atau UID kartu RFID…"></div>
-          <div class="field-row">
-            <div class="field"><label for="history-from">Dari tanggal</label><input id="history-from" type="date" value="${escape(historyFrom)}"></div>
-            <div class="field"><label for="history-to">Sampai tanggal</label><input id="history-to" type="date" value="${escape(historyTo)}"></div>
-            <div class="field"><label for="history-status">Ambang tinggi</label><select id="history-status"><option value="all" ${historyStatus === 'all' ? 'selected' : ''}>Semua pembacaan</option><option value="normal" ${historyStatus === 'normal' ? 'selected' : ''}>Normal (≥ 100 cm)</option><option value="alarm" ${historyStatus === 'alarm' ? 'selected' : ''}>Ambang batas (&lt; 100 cm)</option></select></div>
-            <div class="field"><label for="history-calibration">Status kalibrasi</label><select id="history-calibration"><option value="all" ${historyCalibration === 'all' ? 'selected' : ''}>Semua status</option><option value="confirmed" ${historyCalibration === 'confirmed' ? 'selected' : ''}>Terkalibrasi</option><option value="unconfirmed" ${historyCalibration === 'unconfirmed' ? 'selected' : ''}>Belum terkalibrasi</option></select></div>
-            <div class="field"><label for="history-sort">Urutan tampilan</label><select id="history-sort"><option value="newest" ${historySort === 'newest' ? 'selected' : ''}>Terbaru lebih dulu</option><option value="oldest" ${historySort === 'oldest' ? 'selected' : ''}>Terlama lebih dulu</option><option value="name" ${historySort === 'name' ? 'selected' : ''}>Nama member (A–Z)</option><option value="height-desc" ${historySort === 'height-desc' ? 'selected' : ''}>Tinggi badan tertinggi</option><option value="height-asc" ${historySort === 'height-asc' ? 'selected' : ''}>Tinggi badan terendah</option></select></div>
-          </div>
-        </div>
+    + `<section class="panel"><div class="panel-header"><div><h2>Data pengukuran tersimpan <span class="count" id="history-count">${rows.length}</span></h2><p id="history-result-meta">${historyMeta(rows)}</p></div></div>
         <div id="history-table-region">${measurementLedger(rows)}</div>
       </section>`;
 }

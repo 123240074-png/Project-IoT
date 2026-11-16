@@ -147,7 +147,7 @@ public:
   SPISettings _spiSettings;
 
   MFRC522_DualSPI(SPIClass* spi, uint8_t ssPin, uint8_t rstPin)
-    : _spi(spi), _ssPin(ssPin), _rstPin(rstPin), _spiSettings(4000000, MSBFIRST, SPI_MODE0) {}
+    : _spi(spi), _ssPin(ssPin), _rstPin(rstPin), _spiSettings(2000000, MSBFIRST, SPI_MODE0) {}
 
   void writeRegister(uint8_t reg, uint8_t value) {
     _spi->beginTransaction(_spiSettings);
@@ -192,138 +192,156 @@ public:
       values[0] = (values[0] & ~mask) | (value & mask);
       i++;
     }
-    for (; i < count; i++) {
-      values[i] = _spi->transfer(0x00);
+    while (i < count) {
+      values[i] = _spi->transfer(address);
+      i++;
     }
     digitalWrite(_ssPin, HIGH);
     _spi->endTransaction();
   }
 
   void setBitMask(uint8_t reg, uint8_t mask) {
-    uint8_t current = readRegister(reg);
-    writeRegister(reg, current | mask);
+    writeRegister(reg, readRegister(reg) | mask);
   }
 
   void clearBitMask(uint8_t reg, uint8_t mask) {
-    uint8_t current = readRegister(reg);
-    writeRegister(reg, current & (~mask));
+    writeRegister(reg, readRegister(reg) & (~mask));
   }
 
   void begin() {
     pinMode(_ssPin, OUTPUT);
     digitalWrite(_ssPin, HIGH);
+    pinMode(_rstPin, OUTPUT);
 
-    if (_rstPin != 255) {
-      pinMode(_rstPin, OUTPUT);
-      digitalWrite(_rstPin, LOW);
-      delayMicroseconds(2);
-      digitalWrite(_rstPin, HIGH);
-      delay(50);
-    }
+    // Hard reset modul
+    digitalWrite(_rstPin, LOW);
+    delayMicroseconds(20);
+    digitalWrite(_rstPin, HIGH);
+    delay(50);
 
-    reset();
-    writeRegister(TModeReg, 0x80);
-    writeRegister(TPrescalerReg, 0xA9);
-    writeRegister(TReloadRegH, 0x03);
-    writeRegister(TReloadRegL, 0xE8);
-    writeRegister(TxASKReg, 0x40);
-    writeRegister(ModeReg, 0x3D);
-    antennaOn();
-  }
-
-  void reset() {
+    // Soft reset melalui register
     writeRegister(CommandReg, PCD_SoftReset);
     delay(50);
-    while (readRegister(CommandReg) & (1 << 4)) {
-      delay(1);
-    }
-  }
 
-  void antennaOn() {
-    uint8_t val = readRegister(TxControlReg);
-    if ((val & 0x03) != 0x03) {
-      writeRegister(TxControlReg, val | 0x03);
-    }
+    // Inisialisasi Timer prescaler untuk timeout komunikasi (~40 kHz timer)
+    writeRegister(TModeReg, 0x8D);
+    writeRegister(TPrescalerReg, 0x3E);
+    writeRegister(TReloadRegL, 30);
+    writeRegister(TReloadRegH, 0);
+
+    // Konfigurasi transmiter (100% ASK modulation) & Sensitivitas Maksimum
+    writeRegister(TxASKReg, 0x40);
+    writeRegister(ModeReg, 0x3D);
+    writeRegister(RFCfgReg, (0x07 << 4)); // 48 dB (Max antenna gain)
+
+    // Aktifkan antena (Tx1 & Tx2 output pins)
+    setBitMask(TxControlReg, 0x03);
   }
 
   uint8_t getFirmwareVersion() {
     return readRegister(VersionReg);
   }
 
-  bool isNewCardPresent() {
-    uint8_t bufferATQA[2];
-    uint8_t bufferSize = sizeof(bufferATQA);
-    writeRegister(BitFramingReg, 0x07);
-    return (transceive(PICC_CMD_REQA, bufferATQA, bufferSize) == 0);
-  }
+  bool communicateWithPICC(uint8_t command, uint8_t waitIRq,
+                           uint8_t* sendData, uint8_t sendLen,
+                           uint8_t* backData = nullptr, uint8_t* backLen = nullptr,
+                           uint8_t* validBits = nullptr, uint8_t rxAlign = 0) {
+    uint8_t txLastBits = validBits ? *validBits : 0;
+    uint8_t bitFraming = (rxAlign << 4) + txLastBits;
 
-  bool readCardSerial() {
-    uint8_t responseBuffer[18];
-    uint8_t responseLength = sizeof(responseBuffer);
-    uint8_t cmdBuffer[2] = { PICC_CMD_SEL_CL1, 0x20 };
-
-    if (transceiveData(cmdBuffer, 2, responseBuffer, responseLength) != 0) {
-      return false;
-    }
-
-    if (responseLength >= 5) {
-      uid.size = 4;
-      for (uint8_t i = 0; i < 4; i++) {
-        uid.uidByte[i] = responseBuffer[i];
-      }
-      uid.sak = responseBuffer[4];
-      return true;
-    }
-    return false;
-  }
-
-  void haltA() {
-    uint8_t buffer[4] = { PICC_CMD_HLTA, 0x00, 0x00, 0x00 };
-    calculateCRC(buffer, 2, &buffer[2]);
-    uint8_t responseBuffer[2];
-    uint8_t responseLength = sizeof(responseBuffer);
-    transceiveData(buffer, 4, responseBuffer, responseLength);
-  }
-
-private:
-  uint8_t transceive(uint8_t cmd, uint8_t* backData, uint8_t &backLen) {
-    return transceiveData(&cmd, 1, backData, backLen);
-  }
-
-  uint8_t transceiveData(uint8_t* sendData, uint8_t sendLen, uint8_t* backData, uint8_t &backLen) {
     writeRegister(CommandReg, PCD_Idle);
-    writeRegister(ComIrqReg, 0x7F);
-    writeRegister(FIFOLevelReg, 0x80);
-    writeRegister(FIFODataReg, sendLen, sendData);
-    writeRegister(CommandReg, PCD_Transceive);
-    setBitMask(BitFramingReg, 0x80);
+    writeRegister(ComIrqReg, 0x7F);              // Clear interrupt bits
+    setBitMask(FIFOLevelReg, 0x80);              // Flush FIFO buffer
+    writeRegister(FIFODataReg, sendLen, sendData); // Isi data pengiriman
+    writeRegister(BitFramingReg, bitFraming);
+    writeRegister(CommandReg, command);          // Jalankan command (Transceive)
 
-    uint32_t start = millis();
+    if (command == PCD_Transceive) {
+      setBitMask(BitFramingReg, 0x80);           // StartSend bit
+    }
+
+    // Tunggu proses selesai atau timeout (~36 ms)
+    uint32_t startMs = millis();
     bool completed = false;
-    while (millis() - start < 35) {
+    while (millis() - startMs < 40) {
       uint8_t irq = readRegister(ComIrqReg);
-      if (irq & 0x30) {
+      if (irq & waitIRq) {
         completed = true;
         break;
       }
+      if (irq & 0x01) { // Timer interrupt (timeout)
+        break;
+      }
     }
-    clearBitMask(BitFramingReg, 0x80);
-    if (!completed) return 1;
 
-    uint8_t error = readRegister(ErrorReg);
-    if (error & 0x1B) return 2;
+    clearBitMask(BitFramingReg, 0x80); // Stop send
 
-    uint8_t fifoBytes = readRegister(FIFOLevelReg);
-    if (fifoBytes > backLen) return 3;
-    backLen = fifoBytes;
-    readRegister(FIFODataReg, fifoBytes, backData);
-    return 0;
+    if (!completed) return false;
+
+    uint8_t errorRegValue = readRegister(ErrorReg);
+    if (errorRegValue & 0x13) return false; // BufferOvfl, ParityErr, ProtocolErr
+
+    if (backData && backLen) {
+      uint8_t n = readRegister(FIFOLevelReg);
+      if (n > *backLen) return false;
+      *backLen = n;
+      readRegister(FIFODataReg, n, backData, rxAlign);
+      if (validBits) {
+        *validBits = readRegister(ControlReg) & 0x07;
+      }
+    }
+    return true;
+  }
+
+  bool isNewCardPresent() {
+    // Kirim perintah WUPA (0x52) 7-bit
+    writeRegister(BitFramingReg, 0x07);
+    uint8_t cmd = PICC_CMD_WUPA;
+    uint8_t bufferATQA[2];
+    uint8_t bufferSize = sizeof(bufferATQA);
+    uint8_t validBits = 7;
+
+    bool success = communicateWithPICC(PCD_Transceive, 0x30, &cmd, 1, bufferATQA, &bufferSize, &validBits, 0);
+    return success && (bufferSize == 2);
+  }
+
+  bool readCardSerial() {
+    // Protokol Anti-collision ISO/IEC 14443-3 PICC Cascade Level 1
+    uint8_t buffer[9];
+    buffer[0] = PICC_CMD_SEL_CL1;
+    buffer[1] = 0x20; // NVB (Number of Valid Bits: 2 bytes)
+    uint8_t bufferSize = sizeof(buffer);
+    uint8_t validBits = 0;
+
+    writeRegister(BitFramingReg, 0x00);
+    bool success = communicateWithPICC(PCD_Transceive, 0x30, buffer, 2, buffer, &bufferSize, &validBits, 0);
+    if (!success || bufferSize < 5) return false;
+
+    // Verifikasi XOR Checksum (BCC)
+    uint8_t bcc = buffer[0] ^ buffer[1] ^ buffer[2] ^ buffer[3];
+    if (bcc != buffer[4]) return false;
+
+    // Simpan UID (4 byte)
+    uid.size = 4;
+    for (uint8_t i = 0; i < 4; i++) {
+      uid.uidByte[i] = buffer[i];
+    }
+    return true;
+  }
+
+  void haltA() {
+    uint8_t buffer[4];
+    buffer[0] = PICC_CMD_HLTA;
+    buffer[1] = 0;
+    // Hitung CRC sederhana untuk Halt
+    calculateCRC(buffer, 2, &buffer[2]);
+    communicateWithPICC(PCD_Transceive, 0x30, buffer, 4);
   }
 
   bool calculateCRC(uint8_t* data, uint8_t length, uint8_t* result) {
     writeRegister(CommandReg, PCD_Idle);
     writeRegister(DivIrqReg, 0x04);
-    writeRegister(FIFOLevelReg, 0x80);
+    setBitMask(FIFOLevelReg, 0x80);
     writeRegister(FIFODataReg, length, data);
     writeRegister(CommandReg, PCD_CalcCRC);
 
@@ -331,8 +349,8 @@ private:
     while (millis() - start < 50) {
       if (readRegister(DivIrqReg) & 0x04) {
         writeRegister(CommandReg, PCD_Idle);
-        result[0] = readRegister(0x21);
-        result[1] = readRegister(0x22);
+        result[0] = readRegister(0x21); // CRCResultRegL
+        result[1] = readRegister(0x22); // CRCResultRegH
         return true;
       }
     }
@@ -538,13 +556,21 @@ void setup() {
   vspiBus.begin(PIN_RFID1_SCK, PIN_RFID1_MISO, PIN_RFID1_MOSI, PIN_RFID1_SS);
   rfid1.begin();
   uint8_t v1 = rfid1.getFirmwareVersion();
-  Serial.printf("Version 0x%02X\n", v1);
+  if (v1 != 0x00 && v1 != 0xFF) {
+    Serial.printf("OK! Chip Version: 0x%02X\n", v1);
+  } else {
+    Serial.printf("PERINGATAN (Chip Version: 0x%02X - Cek koneksi VSPI)\n", v1);
+  }
 
   Serial.print(F("[INIT] Inisialisasi RFID 2 (HSPI: SCK=14, MISO=32, MOSI=13, SS=4, RST=21)... "));
   hspiBus.begin(PIN_RFID2_SCK, PIN_RFID2_MISO, PIN_RFID2_MOSI, PIN_RFID2_SS);
   rfid2.begin();
   uint8_t v2 = rfid2.getFirmwareVersion();
-  Serial.printf("Version 0x%02X\n", v2);
+  if (v2 != 0x00 && v2 != 0xFF) {
+    Serial.printf("OK! Chip Version: 0x%02X\n", v2);
+  } else {
+    Serial.printf("PERINGATAN (Chip Version: 0x%02X - Cek koneksi HSPI / Pin MISO 32 / RST 21)\n", v2);
+  }
 
   // 4. Inisialisasi Koneksi Wi-Fi
   Serial.printf("[WIFI] Menghubungkan ke SSID: %s...\n", WIFI_SSID);
@@ -565,10 +591,26 @@ void setup() {
 void loop() {
   const uint32_t now = millis();
 
-  // 1. PENGELOLAAN JARINGAN (WI-FI & MQTT NON-BLOCKING)
+  // 1. HANDLE PERINTAH SERIAL INTERAKTIF (DIAGNOSTIK & TES)
+  if (Serial.available() > 0) {
+    char cmd = (char)Serial.read();
+    if (cmd == 'r' || cmd == 'R') {
+      Serial.println(F("[DIAGNOSTIK] Status Hardware Chip RFID:"));
+      uint8_t v1 = rfid1.getFirmwareVersion();
+      uint8_t v2 = rfid2.getFirmwareVersion();
+      Serial.printf("  RFID 1 (VSPI - Pendaftaran) : Version 0x%02X -> %s\n", v1, (v1 != 0x00 && v1 != 0xFF) ? "OK" : "ERROR (Cek Pin/Kabel)");
+      Serial.printf("  RFID 2 (HSPI - Akses Wahana): Version 0x%02X -> %s\n", v2, (v2 != 0x00 && v2 != 0xFF) ? "OK" : "ERROR (Cek Pin MISO 32 / RST 21)");
+    } else if (cmd == 'b' || cmd == 'B') {
+      buzzerBeepSingle();
+    } else if (cmd == 'n' || cmd == 'N') {
+      buzzerBeepTriple();
+    }
+  }
+
+  // 2. PENGELOLAAN JARINGAN (WI-FI & MQTT NON-BLOCKING)
   handleNetworkReconnections(now);
 
-  // 2. POLLING PEMBACAAN DUAL RFID
+  // 3. POLLING PEMBACAAN DUAL RFID
   if (now - lastRfidMs >= RFID_POLL_INTERVAL_MS) {
     lastRfidMs = now;
 
@@ -587,7 +629,7 @@ void loop() {
       if (now - lastRfid2ReadMs > RFID_COOLDOWN_MS) {
         lastRfid2ReadMs = now;
         publishRfidEvent(2, rfid2.uid);
-        // Respon buzzer pada Reader 2 dikendalikan via instruksi MQTT dari dashboard
+        buzzerBeepSingle(); // Konfirmasi lokal tap kartu
         rfid2.haltA();
       }
     }
