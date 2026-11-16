@@ -1,6 +1,18 @@
 import { repository, addMember, addVisitor, deleteMember, deleteVisitor, recordMeasurement, csvExport, normalizeRfid, formatRfid } from './data.mjs';
-import { parseDeviceLine, parseRfidLine } from './serial-protocol.mjs';
 import { DEFAULT_RIDES, validateRideEligibility, createValidationRecord } from './ride-validator.mjs';
+import {
+  getMqttConfig,
+  saveMqttConfig,
+  connectMqtt,
+  disconnectMqtt,
+  getConnectionState,
+  getDeviceStatus,
+  onMqttConnection,
+  onTelemetry,
+  onRfidReader1,
+  onDeviceStatusChange,
+  sendBuzzerCommand,
+} from './mqtt-service.mjs';
 import {
   loadEnvConfig,
   getSupabaseConfig,
@@ -30,6 +42,8 @@ const icon = name => ({
   check:'<path d="m5 12 4 4L19 6"/>',
   database:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
   alert:'<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
+  mqtt:'<path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/>',
+  settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83 2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
 }[name] || '<circle cx="12" cy="12" r="9"/>');
 const svg = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icon(name)}</svg>`;
 const fmt = value => Number.isFinite(Number(value)) ? Number(value).toFixed(1) : '—';
@@ -52,7 +66,6 @@ function normalizeRoute(hash) {
 let state;
 let route = normalizeRoute(location.hash);
 let selectedVisitorId = '';
-let serialSession = null;
 let latestFrame = null;
 let lastFrameAt = 0;
 let lastSavedSequence = null;
@@ -125,13 +138,32 @@ function frameNow() {
 }
 
 function isLive() {
-  return Boolean(serialSession && lastFrameAt && Date.now() - lastFrameAt <= 3000);
+  return Boolean(lastFrameAt && Date.now() - lastFrameAt <= 3000);
+}
+
+function mqttBrokerPill() {
+  const conn = getConnectionState();
+  const cfg = getMqttConfig();
+  const labels = {
+    connected: 'Broker Online',
+    connecting: 'Menghubungkan…',
+    disconnected: 'Broker Terputus',
+    error: 'Broker Error',
+  };
+  const tone = conn === 'connected' ? 'connected' : conn === 'connecting' ? 'offline' : 'unconfigured';
+  return `<button type="button" class="cloud-pill ${tone}" data-action="open-mqtt-settings" title="Broker MQTT: ${cfg.host}:${cfg.port} (${cfg.topicPrefix}). Klik untuk ubah pengaturan."><i></i><span>${labels[conn] || 'MQTT'}</span></button>`;
 }
 
 function statusPill() {
-  if (!serialSession) return '<button type="button" class="pill offline" data-action="toggle-serial" title="ESP32 terputus. Klik untuk menghubungkan ke serial ESP32 (115200 baud)"><i></i><span>ESP32 terputus</span></button>';
-  if (!isLive()) return '<button type="button" class="pill waiting" data-action="toggle-serial" title="ESP32 terhubung, menunggu data live. Klik untuk memutuskan koneksi serial"><i></i><span>Menunggu data</span></button>';
-  return '<button type="button" class="pill online" data-action="toggle-serial" title="Data live diterima. Klik untuk memutuskan koneksi serial"><i></i><span>Data live diterima</span></button>';
+  const conn = getConnectionState();
+  const live = isLive();
+  if (conn !== 'connected') {
+    return `<button type="button" class="pill offline" data-action="open-mqtt-settings" title="Broker MQTT terputus. Klik untuk memeriksa pengaturan koneksi."><i></i><span>Offline</span></button>`;
+  }
+  if (!live) {
+    return `<button type="button" class="pill waiting" data-action="reconnect-mqtt" title="Broker terhubung, menunggu telemetri dari ESP32."><i></i><span>Menunggu data</span></button>`;
+  }
+  return `<button type="button" class="pill online" data-action="open-mqtt-settings" title="Telemetri live diterima via MQTT. Klik untuk opsi koneksi."><i></i><span>Data live diterima</span></button>`;
 }
 
 function cloudPill() {
@@ -144,13 +176,15 @@ function cloudPill() {
 }
 
 function connectionInfo() {
-  if (!serialSession) return { label:'Terputus', tone:'offline' };
+  const conn = getConnectionState();
+  if (conn !== 'connected') return { label:'Terputus', tone:'offline' };
   if (!isLive()) return { label:'Siaga', tone:'waiting' };
-  return { label:'Live', tone:'online' };
+  return { label:'Live (MQTT)', tone:'online' };
 }
 
 function sensorInfo() {
-  if (!serialSession) return { label:'Tidak aktif', tone:'waiting' };
+  const conn = getConnectionState();
+  if (conn !== 'connected') return { label:'Tidak aktif', tone:'waiting' };
   if (!lastFrameAt) return { label:'Menunggu echo', tone:'waiting' };
   if (Date.now() - lastFrameAt > 3000) return { label:'Data kedaluwarsa', tone:'waiting' };
   if (latestFrame?.status === 'invalid') return { label:'Echo tidak valid', tone:'alarm' };
@@ -167,13 +201,13 @@ function calibrationInfo(frame) {
 function buzzerInfo(frame) {
   if (!frame) return { label:'Pembacaan tidak valid', tone:'waiting', note:'Buzzer tidak aktif tanpa pembacaan valid.' };
   if (frame.buzzerAlarm) return { label:'Alarm aktif', tone:'alarm', note:'Estimasi tinggi di bawah 100 cm; buzzer dikendalikan firmware ESP32.' };
-  return { label:'Normal', tone:'good', note:'Estimasi tinggi 100 cm atau lebih; buzzer mati.' };
+  return { label:'Normal', tone:'good', note:'Estimasi tinggi 100 cm atau lebih; buzzer normal.' };
 }
 
 function frameAgeText() {
   if (!lastFrameAt) {
     if (latestFrame?.status === 'invalid') return 'Pembacaan tidak valid diterima';
-    return serialSession ? 'Menunggu baris data dari ESP32' : 'Menunggu koneksi perangkat';
+    return getConnectionState() === 'connected' ? 'Menunggu baris data dari ESP32' : 'Menunggu koneksi broker';
   }
   const age = Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000));
   const relative = age === 0 ? 'baru saja' : age < 60 ? `${age} detik lalu` : `${Math.round(age / 60)} menit lalu`;
@@ -182,26 +216,23 @@ function frameAgeText() {
 
 function captureState() {
   const frame = frameNow();
-  if (!serialSession) return { ready:false, label:'ESP32 belum terhubung', tone:'waiting' };
+  if (getConnectionState() !== 'connected') return { ready:false, label:'Broker MQTT belum terhubung', tone:'waiting' };
+  if (!isLive()) return { ready:false, label:'Menunggu telemetri ESP32', tone:'waiting' };
   if (latestFrame?.status === 'invalid') return { ready:false, label:'Pembacaan tidak valid', tone:'alarm' };
   if (!frame) return { ready:false, label:'Menunggu data valid', tone:'waiting' };
-  if (!lastFrameAt || Date.now() - lastFrameAt > 3000) return { ready:false, label:'Data sensor kedaluwarsa', tone:'waiting' };
   if (!selectedVisitorId) return { ready:false, label:'Pilih member', tone:'waiting' };
   if (frame.sequence != null && frame.sequence === lastSavedSequence) return { ready:false, label:'Pembacaan ini sudah disimpan', tone:'good' };
-  return { ready:true, label:'Siap disimpan', tone:'good' };
-}
-
-function header(title, subtitle, actions = '') {
-  return `<div class="page-heading"><div><p class="eyebrow">COCOMANG · POS PENGUKURAN</p><h1>${title}</h1><p class="page-subtitle">${subtitle}</p></div>${actions ? `<div class="actions">${actions}</div>` : ''}</div>`;
+  return { ready:true, label:'Siap disimpan ke profil member', tone:'good' };
 }
 
 function summaryCell(label, value, unit, note) {
-  return `<div class="summary-cell"><span class="summary-label">${label}</span><span class="summary-value">${value}<span class="unit">${unit}</span></span><span class="summary-note">${note}</span></div>`;
+  return `<div class="summary-cell"><span class="summary-label">${escape(label)}</span><div class="summary-metric"><span class="summary-value">${escape(String(value))}</span>${unit ? `<span class="summary-unit">${escape(unit)}</span>` : ''}</div><span class="summary-note">${escape(note)}</span></div>`;
 }
 
 function liveReadout(prefix = 'live') {
   const frame = frameNow();
-  const link = { label: serialSession ? 'Terhubung' : 'Terputus', tone: serialSession ? 'good' : 'waiting' };
+  const conn = getConnectionState();
+  const link = { label: conn === 'connected' ? 'Terhubung' : 'Terputus', tone: conn === 'connected' ? 'good' : 'waiting' };
   const sensor = sensorInfo();
   const calibration = calibrationInfo(frame);
   const buzzer = buzzerInfo(frame);
@@ -250,18 +281,18 @@ function dashboardPage() {
         <span class="latest-time">${when(latest.capturedAt)} WIB · jarak ${fmt(latest.distanceCm)} cm</span>
       </div>
       ${previous.length ? `<ul class="latest-list" aria-label="Pengukuran sebelumnya">${previous.map(row => `<li class="latest-row"><div><span class="latest-row-name">${escape(row.visitorName)}</span><span class="latest-row-time">${when(row.capturedAt)}</span></div><span class="latest-row-value">${fmt(row.heightCm)} cm</span></li>`).join('')}</ul>` : ''}`
-    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Hubungkan ESP32, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
-  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('cable')} Buka pengukuran live</a>`)
+    : `<div class="empty"><strong>Belum ada hasil tersimpan.</strong>Koneksi MQTT aktif, pilih member, lalu simpan pembacaan pertama dari pos pengukuran.<br><a class="text-button" href="#pengukuran">Buka pos pengukuran</a></div>`;
+  return header('Ringkasan pos pengukuran', 'Status perangkat, registrasi member, dan hasil pengukuran terakhir dalam satu tampilan operasional.', `<a class="btn primary" href="#pengukuran">${svg('mqtt')} Buka pengukuran live</a>`)
     + `<section class="summary-strip" aria-label="Ringkasan operasional">
         ${summaryCell('Member', state.visitors.length, 'orang', `${measuredMembers} sudah diukur`)}
         ${summaryCell('Sudah diukur', measuredMembers, 'orang', 'Memiliki hasil sensor')}
         ${summaryCell('Belum diukur', unmeasuredMembers, 'orang', 'Menunggu pos ukur')}
         ${summaryCell('Hasil tersimpan', state.measurements.length, 'data', `${measuredToday} hari ini · WIB`)}
-        <div class="summary-cell" id="device-connection-metric"><span class="summary-label">Koneksi perangkat</span><span class="summary-value summary-status ${connection.tone}" id="device-connection-value">${connection.label}</span><span class="summary-note">ESP32 · USB Serial 115200</span></div>
+        <div class="summary-cell" id="device-connection-metric"><span class="summary-label">Koneksi perangkat</span><span class="summary-value summary-status ${connection.tone}" id="device-connection-value">${connection.label}</span><span class="summary-note">ESP32 · MQTT over Wi-Fi</span></div>
       </section>
       <div class="summary-grid">
         <section class="panel instrument-panel summary-instrument">
-          <div class="panel-header"><div><p class="instrument-kicker">Peralatan pengukuran</p><h2>ESP32 · HC-SR04</h2><p>Pembacaan fisik melalui USB Serial · 115200 baud</p></div>${statusPill()}</div>
+          <div class="panel-header"><div><p class="instrument-kicker">Peralatan pengukuran</p><h2>ESP32 · HC-SR04</h2><p>Pembacaan nirkabel melalui MQTT Cloud</p></div>${statusPill()}</div>
           ${liveReadout('dash')}
         </section>
         <section class="panel latest-panel">
@@ -336,9 +367,12 @@ function heightMeasurementView() {
   const readiness = captureState();
   return `<div class="measurement-layout">
       <section class="panel instrument-panel device-panel">
-        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>Web Serial · 115200 baud · Dual MFRC522</p></div>${statusPill()}</div>
-        <div class="device-controls"><button class="btn primary" id="connect-device" data-action="connect" ${serialSession ? 'disabled' : ''}>${svg('cable')} Hubungkan ESP32</button><button class="btn" id="disconnect-device" data-action="disconnect" ${serialSession ? '' : 'disabled'}>Putuskan</button></div>
-        <p class="device-note" id="serial-help">Tutup Serial Monitor Arduino IDE sebelum menghubungkan perangkat. Gunakan Chrome atau Edge desktop melalui localhost atau HTTPS.</p>
+        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>MQTT Cloud · Dual MFRC522</p></div>${statusPill()}</div>
+        <div class="device-controls">
+          <button class="btn primary" id="mqtt-settings" data-action="open-mqtt-settings">${svg('settings')} Pengaturan Broker</button>
+          <button class="btn" id="reconnect-mqtt" data-action="reconnect-mqtt">Sambung Ulang</button>
+        </div>
+        <p class="device-note" id="mqtt-help">ESP32 mengirim data sensor secara nirkabel melalui Wi-Fi. Dashboard terhubung via Secure WebSockets (WSS).</p>
         ${liveReadout('measure')}
       </section>
       <section class="panel capture-panel">
@@ -403,7 +437,7 @@ function filteredMeasurements() {
 }
 
 function measurementLedger(rows) {
-  if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Hubungkan ESP32 melalui pos pengukuran, pilih member, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
+  if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Koneksi MQTT aktif melalui pos pengukuran, pilih member, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
   if (!rows.length) return '<div class="empty"><strong>Tidak ada data yang cocok.</strong>Ubah rentang tanggal atau filter, lalu coba lagi.<br><button class="text-button" data-action="clear-filter">Reset semua filter</button></div>';
   return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan member</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama member</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong member-name">${escape(row.visitorName)}</span>${row.memberRfid ? `<span class="row-note"><code class="rfid-badge">${escape(row.memberRfid)}</code></span>` : ''}</td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples}/5 sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
@@ -413,27 +447,20 @@ function historyMeta(rows) {
   return rows.length === total ? `Menampilkan seluruh ${total} data tersimpan.` : `Menampilkan ${rows.length} dari ${total} data tersimpan.`;
 }
 
-function historyToolbar() {
-  const option = (value, label, current) => `<option value="${value}"${value === current ? ' selected' : ''}>${label}</option>`;
-  return `<div class="history-toolbar" aria-label="Filter riwayat pengukuran">
-    <label class="tool-field search"><span>Cari nama / UID</span><input id="history-search" type="search" placeholder="Cari nama atau UID RFID" autocomplete="off" value="${escape(historySearch)}"></label>
-    <label class="tool-field"><span>Dari</span><input id="history-from" type="date" value="${escape(historyFrom)}"></label>
-    <label class="tool-field"><span>Sampai</span><input id="history-to" type="date" value="${escape(historyTo)}"></label>
-    <label class="tool-field"><span>Status</span><select id="history-status">${option('all', 'Semua status', historyStatus)}${option('normal', 'Normal', historyStatus)}${option('alarm', 'Ambang buzzer', historyStatus)}</select></label>
-    <label class="tool-field"><span>Kalibrasi</span><select id="history-calibration">${option('all', 'Semua kalibrasi', historyCalibration)}${option('confirmed', 'Terkalibrasi', historyCalibration)}${option('unconfirmed', 'Belum terkalibrasi', historyCalibration)}</select></label>
-    <label class="tool-field"><span>Urutkan</span><select id="history-sort">${option('newest', 'Terbaru', historySort)}${option('oldest', 'Terlama', historySort)}${option('name', 'Nama A–Z', historySort)}${option('height-desc', 'Tinggi tertinggi', historySort)}${option('height-asc', 'Tinggi terendah', historySort)}</select></label>
-    <button class="btn filter-reset" data-action="clear-filter">Reset</button>
-  </div>`;
-}
-
 function historyPage() {
   const rows = filteredMeasurements();
-  const exportActions = `<button class="btn" data-action="export-csv">${svg('download')} Ekspor CSV</button><button class="btn primary" data-action="print-pdf">${svg('printer')} Cetak / Simpan PDF</button>`;
-  return header('Riwayat pengukuran', 'Ledger hasil aktual yang disimpan dari ESP32. Pencarian, filter, ekspor, dan cetak mengikuti data tersimpan.', exportActions)
-    + `<section class="panel">
-        <div class="panel-header"><div><h2>Data pengukuran <span class="count" id="history-count">${rows.length}</span></h2><p>Rekaman bertambah saat operator menekan Simpan hasil ukur.</p></div><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>
-        ${historyToolbar()}
-        <div class="history-meta"><span id="history-result-meta">${historyMeta(rows)}</span><span>Waktu WIB · ${supabaseStatus === 'connected' ? 'Cloud & Lokal' : 'data lokal'}</span></div>
+  return header('Ledger riwayat pengukuran', 'Audit menyeluruh pembacaan sensor ultrasonik, UID kartu RFID, dan catatan kalibrasi perangkat.', `<button class="btn" data-action="export-csv">${svg('download')} Ekspor CSV</button><button class="btn" data-action="print-pdf">${svg('printer')} Cetak laporan</button>`)
+    + `<section class="panel"><div class="panel-header"><div><h2>Data pengukuran tersimpan <span class="count" id="history-count">${rows.length}</span></h2><p id="history-result-meta">${historyMeta(rows)}</p></div><button class="text-button" data-action="clear-filter">Reset filter</button></div>
+        <div class="filter-strip" aria-label="Filter ledger pengukuran">
+          <div class="field"><label for="history-search">Pencarian member atau UID</label><input id="history-search" value="${escape(historySearch)}" placeholder="Cari nama atau UID kartu RFID…"></div>
+          <div class="field-row">
+            <div class="field"><label for="history-from">Dari tanggal</label><input id="history-from" type="date" value="${escape(historyFrom)}"></div>
+            <div class="field"><label for="history-to">Sampai tanggal</label><input id="history-to" type="date" value="${escape(historyTo)}"></div>
+            <div class="field"><label for="history-status">Ambang tinggi</label><select id="history-status"><option value="all" ${historyStatus === 'all' ? 'selected' : ''}>Semua pembacaan</option><option value="normal" ${historyStatus === 'normal' ? 'selected' : ''}>Normal (≥ 100 cm)</option><option value="alarm" ${historyStatus === 'alarm' ? 'selected' : ''}>Ambang batas (&lt; 100 cm)</option></select></div>
+            <div class="field"><label for="history-calibration">Status kalibrasi</label><select id="history-calibration"><option value="all" ${historyCalibration === 'all' ? 'selected' : ''}>Semua status</option><option value="confirmed" ${historyCalibration === 'confirmed' ? 'selected' : ''}>Terkalibrasi</option><option value="unconfirmed" ${historyCalibration === 'unconfirmed' ? 'selected' : ''}>Belum terkalibrasi</option></select></div>
+            <div class="field"><label for="history-sort">Urutan tampilan</label><select id="history-sort"><option value="newest" ${historySort === 'newest' ? 'selected' : ''}>Terbaru lebih dulu</option><option value="oldest" ${historySort === 'oldest' ? 'selected' : ''}>Terlama lebih dulu</option><option value="name" ${historySort === 'name' ? 'selected' : ''}>Nama member (A–Z)</option><option value="height-desc" ${historySort === 'height-desc' ? 'selected' : ''}>Tinggi badan tertinggi</option><option value="height-asc" ${historySort === 'height-asc' ? 'selected' : ''}>Tinggi badan terendah</option></select></div>
+          </div>
+        </div>
         <div id="history-table-region">${measurementLedger(rows)}</div>
       </section>`;
 }
@@ -448,6 +475,10 @@ function renderHistoryTable() {
   if (meta) meta.textContent = historyMeta(rows);
 }
 
+function header(title, subtitle, actions = '') {
+  return `<section class="view-header"><div class="view-intro"><p class="eyebrow">Pos pengukuran fisik</p><h1>${escape(title)}</h1><p class="view-subtitle">${escape(subtitle)}</p></div>${actions ? `<div class="view-actions">${actions}</div>` : ''}</section>`;
+}
+
 function render() {
   const current = navs.find(item => item[0] === route)?.[1] || 'Ringkasan';
   document.title = `${current} | COCOMANG`;
@@ -456,9 +487,9 @@ function render() {
       <div class="masthead-inner">
         <a class="brand" href="#ringkasan"><span class="brand-name">COCOMANG</span><span class="brand-caption">Smart Height Measurement System</span></a>
         <div class="desk-identity"><span>Pos Ukur & Wahana</span><strong>ESP32 Dual RFID</strong></div>
-        <div class="operator"><span class="mode-label">Serial 115200</span>${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan koneksi perangkat">${svg('info')}</button></div>
+        <div class="operator"><span class="mode-label">MQTT Cloud</span>${mqttBrokerPill()}${statusPill()}${cloudPill()}<button class="icon-button" data-action="help" aria-label="Panduan sistem">${svg('info')}</button></div>
       </div>
-      <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}<a class="nav-link nav-link-wahana" href="./kiosk.html" style="margin-left: auto; color: var(--green); font-weight: 600;" title="Kembali ke Pos Wahana (Kiosk Mandiri RFID 2)"><span>Kembali ke Pos Wahana</span></a></nav>
+      <nav class="nav-list" aria-label="Navigasi utama">${navs.map(([id, label], index) => `<a class="nav-link ${route === id ? 'active' : ''}" href="#${id}" ${route === id ? 'aria-current="page"' : ''}><span class="nav-number">0${index + 1}</span><span>${label}</span></a>`).join('')}<a class="nav-link nav-link-wahana" href="./kiosk.html" style="margin-left: auto; color: var(--green); font-weight: 600;" title="Buka Loket Wahana (Kiosk Mandiri RFID 2)"><span>Buka Loket Wahana (Kiosk) →</span></a></nav>
     </header>
     <div class="workspace"><div class="topbar"><span class="breadcrumb">Pos pengukuran <span>/</span> <strong>${current}</strong></span><span class="date-label">${new Date().toLocaleDateString('id-ID', { weekday:'long', day:'numeric', month:'long', year:'numeric', timeZone:'Asia/Jakarta' })}</span></div>
       <main id="main" tabindex="-1">${route === 'ringkasan' ? dashboardPage() : (route === 'member' || route === 'pengunjung') ? membersPage() : route === 'pengukuran' ? measurementPage() : historyPage()}
@@ -469,25 +500,22 @@ function render() {
 }
 
 function updateConnectionUI() {
-  const connected = Boolean(serialSession);
+  const conn = getConnectionState();
   const live = isLive();
-  const stateText = !connected ? 'ESP32 terputus' : live ? 'Data live diterima' : 'Menunggu data';
+  const stateText = conn !== 'connected' ? 'Offline' : live ? 'Data live diterima' : 'Menunggu data';
   $$('.pill').forEach(element => {
-    element.className = `pill ${!connected ? 'offline' : live ? 'online' : 'waiting'}`;
+    element.className = `pill ${conn !== 'connected' ? 'offline' : live ? 'online' : 'waiting'}`;
     element.innerHTML = `<i></i><span>${stateText}</span>`;
-    element.title = !connected
-      ? 'ESP32 terputus. Klik untuk menghubungkan ke serial ESP32 (115200 baud)'
+    element.title = conn !== 'connected'
+      ? 'Broker MQTT terputus. Klik untuk membuka pengaturan broker.'
       : live
-        ? 'Data live diterima. Klik untuk memutuskan koneksi serial'
-        : 'ESP32 terhubung, menunggu data. Klik untuk memutuskan koneksi serial';
+        ? 'Data live diterima via MQTT. Klik untuk opsi koneksi.'
+        : 'Broker terhubung, menunggu data dari ESP32.';
     if (element.tagName === 'BUTTON') {
-      element.dataset.action = 'toggle-serial';
+      element.dataset.action = 'open-mqtt-settings';
     }
   });
-  const connect = $('#connect-device');
-  const disconnect = $('#disconnect-device');
-  if (connect) connect.disabled = connected;
-  if (disconnect) disconnect.disabled = !connected;
+
   const connection = connectionInfo();
   const connectionMetric = $('#device-connection-value');
   if (connectionMetric) {
@@ -497,7 +525,7 @@ function updateConnectionUI() {
   }
 
   const frame = frameNow();
-  const link = { label: connected ? 'Terhubung' : 'Terputus', tone: connected ? 'good' : 'waiting' };
+  const link = { label: conn === 'connected' ? 'Terhubung' : 'Terputus', tone: conn === 'connected' ? 'good' : 'waiting' };
   const sensor = sensorInfo();
   const calibration = calibrationInfo(frame);
   const buzzer = buzzerInfo(frame);
@@ -530,18 +558,6 @@ function updateConnectionUI() {
   }
 }
 
-async function sendSerialCommand(cmd) {
-  if (!serialSession?.port?.writable) return;
-  try {
-    const writer = serialSession.port.writable.getWriter();
-    const encoder = new TextEncoder();
-    await writer.write(encoder.encode(cmd + '\n'));
-    writer.releaseLock();
-  } catch (err) {
-    console.warn('Gagal mengirim perintah serial ke ESP32:', err);
-  }
-}
-
 async function handleRideValidation(member, readerId = 2) {
   const ride = activeRides.find(r => r.id === selectedRideId) || activeRides[0];
   if (!ride) return;
@@ -562,10 +578,10 @@ async function handleRideValidation(member, readerId = 2) {
   }
 
   if (evaluation.eligible) {
-    await sendSerialCommand('b'); // Bip 1x normal
+    await sendBuzzerCommand('b'); // Bip 1x normal
     toast(`[VALIDASI] ${member.name} LOLOS masuk wahana ${ride.name}!`);
   } else {
-    await sendSerialCommand('n'); // Bip 3x peringatan
+    await sendBuzzerCommand('n'); // Bip 3x peringatan
     toast(`[VALIDASI] ${member.name} DITOLAK: ${evaluation.reason}`, true);
   }
 
@@ -578,115 +594,108 @@ async function handleRideValidation(member, readerId = 2) {
       readerId,
       now: lastValidation.timestamp,
     });
-    await recordSupabaseValidation(record);
+    if (supabaseStatus === 'connected') {
+      await recordSupabaseValidation(record);
+    }
   } catch (err) {
     console.warn('Gagal mencatat log validasi ke Supabase:', err);
   }
 }
 
-function processSerialLine(line) {
-  const rfidEvent = parseRfidLine(line);
-  if (rfidEvent) {
-    // Batasan: Pos Pendaftaran HANYA boleh memproses tap dari RFID 1 (Pendaftaran)
-    if (rfidEvent.reader !== 1) {
-      toast(`[Abaikan Tap Reader ${rfidEvent.reader}] Pos Pendaftaran hanya memproses RFID 1 (Pendaftaran). Silakan buka Loket Kiosk untuk memproses RFID 2.`, true);
-      return;
-    }
-
-    lastScannedRfid = rfidEvent.uid;
-    const rfidInput = document.getElementById('member-rfid');
-    if (rfidInput) {
-      rfidInput.value = rfidEvent.uid;
-      rfidInput.focus();
-      toast(`Kartu RFID terdeteksi dari Reader 1 (Pendaftaran): ${rfidEvent.uid}`);
-      return;
-    }
-
-    const matchedMember = state.visitors.find(m => m.rfidUid && normalizeRfid(m.rfidUid) === normalizeRfid(rfidEvent.uid));
-
-    // Pemrosesan Member via Reader 1 (Pendaftaran Member)
-    if (matchedMember) {
-      selectedVisitorId = matchedMember.id;
-      const select = document.getElementById('measurement-visitor');
-      if (select) select.value = matchedMember.id;
-      updateConnectionUI();
-      toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via Reader 1 (Pendaftaran).`);
-    } else {
-      toast(`Kartu RFID ${rfidEvent.uid} terdeteksi di Reader 1. Membuka formulir pendaftaran member…`);
-      memberForm(rfidEvent.uid);
-    }
+function handleRfidEventReader1(rfidEvent) {
+  if (!rfidEvent?.uid) return;
+  lastScannedRfid = rfidEvent.uid;
+  const rfidInput = document.getElementById('member-rfid');
+  if (rfidInput) {
+    rfidInput.value = rfidEvent.uid;
+    rfidInput.focus();
+    toast(`Kartu RFID terdeteksi dari Reader 1 (Pendaftaran): ${rfidEvent.uid}`);
     return;
   }
 
-  const frame = parseDeviceLine(line);
-  if (!frame) return;
-  latestFrame = frame;
-  lastFrameAt = Date.now();
-  updateConnectionUI();
-}
-
-async function connectDevice() {
-  if (!('serial' in navigator)) {
-    toast('Web Serial tidak tersedia. Gunakan Chrome atau Edge desktop melalui localhost atau HTTPS.', true);
-    return;
-  }
-  if (serialSession) return;
-  let port;
-  try {
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
-    const session = { port, reader: null, cancelled: false };
-    serialSession = session;
-    latestFrame = null;
-    lastFrameAt = 0;
-    lastSavedSequence = null;
+  const matchedMember = state.visitors.find(m => m.rfidUid && normalizeRfid(m.rfidUid) === normalizeRfid(rfidEvent.uid));
+  if (matchedMember) {
+    selectedVisitorId = matchedMember.id;
+    const select = document.getElementById('measurement-visitor');
+    if (select) select.value = matchedMember.id;
     updateConnectionUI();
-    toast('ESP32 terhubung. Menunggu data live dari firmware…');
-
-    const reader = port.readable.getReader();
-    session.reader = reader;
-    const decoder = new TextDecoder();
-    let buffer = '';
-    try {
-      while (!session.cancelled) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let newlineIndex;
-        while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newlineIndex).replace(/\r$/, '');
-          buffer = buffer.slice(newlineIndex + 1);
-          processSerialLine(line);
-        }
-        if (buffer.length > 4096) buffer = buffer.slice(-2048);
-      }
-    } finally {
-      try { reader.releaseLock(); } catch {}
-    }
-  } catch (error) {
-    const message = error?.name === 'NotFoundError' ? 'Pemilihan port dibatalkan.' : error?.message || 'Tidak dapat membuka port serial.';
-    if (error?.name !== 'NotFoundError') toast(`${message} Pastikan Serial Monitor ditutup dan port tidak dipakai aplikasi lain.`, true);
-  } finally {
-    if (serialSession?.port === port) {
-      serialSession = null;
-      try { if (port?.readable) await port.close(); } catch {}
-      updateConnectionUI();
-      if (port) toast('Koneksi ESP32 terputus.');
-    }
+    toast(`Member ${matchedMember.name} (${matchedMember.rfidUid}) terpilih via Reader 1 (Pendaftaran).`);
+  } else {
+    toast(`Kartu RFID ${rfidEvent.uid} terdeteksi di Reader 1. Membuka formulir pendaftaran member…`);
+    memberForm(rfidEvent.uid);
   }
-}
-
-async function disconnectDevice() {
-  const session = serialSession;
-  if (!session) return;
-  session.cancelled = true;
-  try { await session.reader?.cancel(); } catch {}
-  try { if (session.port?.readable) await session.port.close(); } catch {}
 }
 
 function openModal(title, subtitle, content) {
   modal.innerHTML = `<div class="modal-head"><div><h2 id="modal-title">${escape(title)}</h2><p>${escape(subtitle)}</p></div><button class="icon-button" data-action="close-modal" aria-label="Tutup">${svg('close')}</button></div><div class="modal-content">${content}</div>`;
   if (!modal.open) modal.showModal();
+}
+
+function openMqttModal() {
+  const cfg = getMqttConfig();
+  const conn = getConnectionState();
+  const labels = {
+    connected: '<span class="status good">🟢 Terhubung ke Broker Cloud</span>',
+    connecting: '<span class="status waiting">🟡 Sedang Menghubungkan…</span>',
+    disconnected: '<span class="status">⚪ Terputus</span>',
+    error: '<span class="status alarm">🔴 Gagal Terhubung</span>',
+  };
+
+  openModal('Pengaturan MQTT Cloud Broker', 'Konfigurasi broker MQTT over WebSockets untuk komunikasi nirkabel dengan ESP32.', `<form id="mqtt-form" class="form-grid">
+    <div class="db-settings-status">Status Broker: ${labels[conn] || labels.disconnected}</div>
+    <div id="mqtt-form-error" role="alert"></div>
+    <div class="field">
+      <label for="mqtt-host">Broker Host (WebSocket) <span class="req">*</span></label>
+      <input id="mqtt-host" name="host" required placeholder="broker.emqx.io" value="${escape(cfg.host)}">
+      <p class="field-help">Default: <code>broker.emqx.io</code> (atau cluster HiveMQ Cloud Anda).</p>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="mqtt-port">Port WebSocket <span class="req">*</span></label>
+        <input id="mqtt-port" name="port" type="number" required placeholder="8084" value="${cfg.port}">
+      </div>
+      <div class="field">
+        <label for="mqtt-protocol">Protokol</label>
+        <select id="mqtt-protocol" name="protocol">
+          <option value="wss" ${cfg.protocol === 'wss' ? 'selected' : ''}>WSS (Secure WebSocket)</option>
+          <option value="ws" ${cfg.protocol === 'ws' ? 'selected' : ''}>WS (Plain WebSocket)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="mqtt-path">WebSocket Path</label>
+        <input id="mqtt-path" name="path" placeholder="/mqtt" value="${escape(cfg.path)}">
+      </div>
+    </div>
+    <div class="field">
+      <label for="mqtt-prefix">Topic Prefix <span class="req">*</span></label>
+      <input id="mqtt-prefix" name="topicPrefix" required placeholder="cocomang" value="${escape(cfg.topicPrefix)}">
+      <p class="field-help">Harus sama dengan <code>MQTT_TOPIC_PREFIX</code> pada firmware ESP32 (contoh: <code>cocomang</code>).</p>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="mqtt-user">Username (opsional)</label>
+        <input id="mqtt-user" name="username" placeholder="Kosongkan jika anonymous" value="${escape(cfg.username || '')}">
+      </div>
+      <div class="field">
+        <label for="mqtt-pass">Password (opsional)</label>
+        <input id="mqtt-pass" name="password" type="password" placeholder="Password broker" value="${escape(cfg.password || '')}">
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn" data-action="close-modal">Batal</button>
+      <button class="btn primary" type="submit">Simpan & Sambungkan</button>
+    </div>
+  </form>`);
+
+  $('#mqtt-form')?.addEventListener('submit', event => {
+    event.preventDefault();
+    const data = Object.fromEntries(new FormData(event.currentTarget));
+    data.port = Number(data.port) || 8084;
+    saveMqttConfig(data);
+    modal.close();
+    toast('Menghubungkan ke broker MQTT…');
+    connectMqtt(data);
+  });
 }
 
 function memberForm(prefillRfid = '') {
@@ -696,7 +705,7 @@ function memberForm(prefillRfid = '') {
     <div class="field">
       <label for="member-rfid">UID Kartu RFID <span class="req">*</span></label>
       <input id="member-rfid" name="rfidUid" required autocomplete="off" spellcheck="false" placeholder="Contoh: 04:A1:B2:C3 atau 04A1B2C3" value="${escape(initialRfid)}">
-      <p class="field-help">${serialSession ? 'Dekatkan kartu ke Reader 1 (Pendaftaran) atau masukkan kode UID.' : 'Format 4, 7, atau 10 byte heksadesimal (contoh: 04:A1:B2:C3).'}</p>
+      <p class="field-help">Dekatkan kartu ke <strong>Reader 1 (Pendaftaran)</strong> untuk auto-fill atau ketik manual.</p>
     </div>
     <div class="field"><label for="member-name">Nama lengkap <span class="req">*</span></label><input id="member-name" name="name" required minlength="2" maxlength="100" autocomplete="name" placeholder="Nama member"></div>
     <div class="field-row">
@@ -708,7 +717,7 @@ function memberForm(prefillRfid = '') {
     <p class="form-note">Kartu RFID berfungsi sebagai tiket akses member. Tinggi badan akan diukur melalui sensor ultrasonik pada pos ukur.</p>
     <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan member</button></div>
   </form>`);
-  $('#member-form').addEventListener('submit', async event => {
+  $('#member-form')?.addEventListener('submit', async event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
@@ -749,157 +758,146 @@ async function openSupabaseModal() {
       <p class="field-help">Dapat dilihat di Dashboard Supabase → Project Settings → API.</p>
     </div>
     <div class="field">
-      <label for="sb-key">Supabase Anon Public Key <span class="req">*</span></label>
-      <input id="sb-key" type="password" placeholder="eyJhbGciOiJIUzI1NiIsIn..." value="${escape(cfg.anonKey)}">
-      <p class="field-help">Kunci publik anonim (aman digunakan di browser client).</p>
+      <label for="sb-key">Supabase Anon Public API Key <span class="req">*</span></label>
+      <input id="sb-key" type="password" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." value="${escape(cfg.anonKey)}">
+      <p class="field-help">Gunakan <code>anon</code> / <code>public</code> key yang aman untuk browser.</p>
     </div>
-    <div class="modal-actions" style="margin-top:10px;">
-      <button type="button" class="btn" id="btn-test-db">Tes Koneksi</button>
-      <button type="button" class="btn" id="btn-sync-local">Sinkronkan Data Lokal ke Cloud</button>
-      <button type="button" class="btn primary" id="btn-save-db">Simpan Pengaturan</button>
+    <div class="modal-actions">
+      <button type="button" class="btn" data-action="close-modal">Batal</button>
+      <button class="btn" id="btn-test-db">Uji Koneksi</button>
+      <button class="btn primary" id="btn-save-db">Simpan Konfigurasi</button>
     </div>
-    <div class="db-quick-guide">
-      <strong>Catatan Setup:</strong> Pastikan tabel <code>members</code>, <code>rides</code>, dan <code>ride_validations</code> sudah dibuat menggunakan file <code>cocomang/supabase/schema.sql</code> di Supabase SQL Editor.
-    </div>
+    ${supabaseStatus === 'connected' ? '<div style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px;"><button type="button" class="btn tiny" id="btn-sync-local" style="width:100%;">Sinkronkan Seluruh Data Lokal ke Cloud</button></div>' : ''}
   </div>`);
 
   $('#btn-test-db')?.addEventListener('click', async () => {
     const url = $('#sb-url').value.trim();
     const key = $('#sb-key').value.trim();
-    if (!url || !key) {
-      $('#db-form-error').innerHTML = '<p class="error-banner">Masukkan Project URL dan Anon Key terlebih dahulu.</p>';
-      return;
-    }
-    $('#db-status-box').innerHTML = 'Menguji koneksi ke Supabase…';
-    const result = await testSupabaseConnection(url, key);
-    if (result.success) {
-      $('#db-form-error').innerHTML = '';
-      $('#db-status-box').innerHTML = '<span class="status good">🟢 Sukses: Terhubung ke database Supabase!</span>';
+    const errBox = $('#db-form-error');
+    errBox.innerHTML = '<p class="notice">Menguji koneksi ke Supabase…</p>';
+    const res = await testSupabaseConnection(url, key);
+    if (res.success) {
+      errBox.innerHTML = '<p class="status good" style="padding:8px 12px;border-radius:4px;">Koneksi berhasil! Database PostgreSQL siap digunakan.</p>';
     } else {
-      $('#db-form-error').innerHTML = `<p class="error-banner">${escape(result.message)}</p>`;
-      $('#db-status-box').innerHTML = '<span class="status alarm">🔴 Gagal menghubungi Supabase</span>';
+      errBox.innerHTML = `<p class="error-banner">${escape(res.error)}</p>`;
     }
   });
 
   $('#btn-save-db')?.addEventListener('click', async () => {
     const url = $('#sb-url').value.trim();
     const key = $('#sb-key').value.trim();
-    saveSupabaseConfig({ url, anonKey: key });
-    if (url && key) {
-      const test = await testSupabaseConnection(url, key);
-      supabaseStatus = test.success ? 'connected' : 'offline';
-      if (test.success) {
-        await initCloudData();
-      }
-    } else {
-      supabaseStatus = 'unconfigured';
+    if (!url || !key) {
+      $('#db-form-error').innerHTML = '<p class="error-banner">URL dan Anon Key wajib diisi.</p>';
+      return;
     }
+    saveSupabaseConfig({ url, anonKey: key });
+    toast('Konfigurasi database disimpan.');
     modal.close();
+
+    const test = await testSupabaseConnection(url, key);
+    supabaseStatus = test.success ? 'connected' : 'offline';
+    if (test.success) {
+      toast('Berhasil terhubung ke Supabase Cloud!');
+      await initCloudData();
+    }
     render();
-    toast(supabaseStatus === 'connected' ? 'Pengaturan Supabase disimpan & terhubung!' : 'Pengaturan disimpan (Mode Lokal).');
   });
 
   $('#btn-sync-local')?.addEventListener('click', async () => {
-    if (supabaseStatus !== 'connected') {
-      toast('Hubungkan Supabase terlebih dahulu sebelum sinkronisasi.', true);
-      return;
-    }
-    const res = await syncLocalMembersToSupabase(state.visitors);
-    if (res.synced > 0) {
-      toast(`${res.synced} data member berhasil diunggah ke Supabase!`);
+    const btn = $('#btn-sync-local');
+    btn.disabled = true;
+    btn.textContent = 'Menyinkronkan…';
+    const result = await syncLocalMembersToSupabase(state.visitors);
+    btn.disabled = false;
+    btn.textContent = 'Sinkronkan Seluruh Data Lokal ke Cloud';
+    if (result.success) {
+      toast(`Sinkronisasi berhasil: ${result.count} member terunggah.`);
+      modal.close();
     } else {
-      toast('Tidak ada data baru untuk disinkronkan.');
+      $('#db-form-error').innerHTML = `<p class="error-banner">${escape(result.error)}</p>`;
     }
   });
 }
 
-async function saveLiveReading() {
-  if (!serialSession) throw new Error('ESP32 belum terhubung.');
-  if (!latestFrame || latestFrame.status !== 'ok') throw new Error('Belum ada pembacaan live yang valid dari ESP32.');
-  if (!lastFrameAt || Date.now() - lastFrameAt > 3000) throw new Error('Data sensor sudah kedaluwarsa. Tunggu pembacaan live berikutnya.');
-  if (!selectedVisitorId) throw new Error('Pilih member terlebih dahulu.');
-  if (latestFrame.sequence != null && latestFrame.sequence === lastSavedSequence) throw new Error('Pembacaan ini sudah disimpan. Tunggu data live berikutnya.');
-  let entry;
-  commit(next => { entry = recordMeasurement(next, selectedVisitorId, latestFrame); });
-  lastSavedSequence = latestFrame.sequence;
-  toast(`Hasil ${fmt(entry.heightCm)} cm tersimpan untuk ${entry.visitorName}.`);
-
-  // Update tinggi member di Supabase
+function saveLiveReading() {
+  const readiness = captureState();
+  if (!readiness.ready) throw new Error(readiness.label);
+  const frame = frameNow();
+  if (!frame) throw new Error('Data frame belum valid.');
   const member = state.visitors.find(m => m.id === selectedVisitorId);
-  if (member?.rfidUid && supabaseStatus === 'connected') {
-    void updateSupabaseMemberHeight(member.rfidUid, entry.heightCm, entry.capturedAt);
+  if (!member) throw new Error('Pilih member terlebih dahulu.');
+
+  let entry;
+  commit(next => {
+    entry = recordMeasurement(next, {
+      visitorId: member.id,
+      visitorName: member.name,
+      memberRfid: member.rfidUid || '',
+      distanceCm: frame.distanceCm,
+      heightCm: frame.heightCm,
+      sequence: frame.sequence,
+      buzzerAlarm: frame.buzzerAlarm,
+      calibrated: frame.calibrated,
+    });
+  });
+
+  lastSavedSequence = frame.sequence;
+  updateConnectionUI();
+  toast(`Tinggi ${member.name} (${fmt(frame.heightCm)} cm) berhasil disimpan.`);
+
+  // Sinkronkan perubahan tinggi member ke Supabase Cloud
+  if (supabaseStatus === 'connected' && member.rfidUid) {
+    void updateSupabaseMemberHeight(member.rfidUid, frame.heightCm, entry.capturedAt);
   }
-
-  render();
-}
-
-function download(name, content, type) {
-  const url = URL.createObjectURL(new Blob([content], { type }));
-  const anchor = document.createElement('a');
-  anchor.href = url;
-  anchor.download = name;
-  anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
 function exportMeasurementsCsv() {
-  const rows = filteredMeasurements();
-  if (!rows.length) {
-    toast('Tidak ada data untuk diekspor pada filter saat ini.', true);
-    return;
-  }
-  const data = rows.map(row => ({
-    'Waktu WIB': when(row.capturedAt),
-    'Member': row.visitorName,
-    'UID RFID': row.memberRfid || '—',
-    'Tinggi (cm)': row.heightCm,
-    'Jarak sensor (cm)': row.distanceCm,
-    'Tinggi referensi (cm)': row.referenceHeightCm,
-    'Offset (cm)': row.offsetCm,
-    'Sampel valid': `${row.validSamples}/5`,
-    'Status pengukuran': row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Normal',
-    'Kalibrasi': row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi',
-  }));
-  download('cocomang-riwayat-pengukuran.csv', csvExport(data), 'text/csv;charset=utf-8');
+  const csv = csvExport(state.measurements);
+  const blob = new Blob([csv], { type:'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `cocomang-pengukuran-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a);
+  toast('Berkas CSV berhasil diunduh.');
 }
 
 function printPdfReport() {
   const rows = filteredMeasurements();
   if (!rows.length) {
-    toast('Belum ada data pengukuran pada filter yang dipilih.', true);
+    toast('Tidak ada data riwayat yang dapat dicetak.', true);
     return;
   }
   const printWindow = window.open('', '_blank');
   if (!printWindow) {
-    toast('Jendela laporan diblokir. Izinkan pop-up untuk membuat PDF.', true);
+    toast('Gagal membuka jendela cetak. Periksa setelan pop-up browser.', true);
     return;
   }
-  const values = rows.map(row => row.heightCm);
-  const average = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const min = Math.min(...values);
-  const max = Math.max(...values);
+  const average = rows.reduce((acc, row) => acc + row.heightCm, 0) / rows.length;
+  const min = Math.min(...rows.map(row => row.heightCm));
+  const max = Math.max(...rows.map(row => row.heightCm));
   const calibratedCount = rows.filter(row => row.calibrated).length;
   const filters = [
-    historyFrom || historyTo ? `Periode ${historyFrom || 'awal data'} — ${historyTo || 'terbaru'}` : 'Seluruh data tersimpan',
-    historySearch ? `Nama memuat “${historySearch}”` : '',
-    historyStatus !== 'all' ? `Status ${historyStatus === 'alarm' ? 'ambang buzzer aktif' : 'normal'}` : '',
-    historyCalibration !== 'all' ? `Kalibrasi ${historyCalibration === 'confirmed' ? 'terkalibrasi' : 'belum terkalibrasi'}` : '',
-  ].filter(Boolean).join(' · ');
+    historySearch ? `pencarian: "${historySearch}"` : '',
+    historyStatus !== 'all' ? `ambang: ${historyStatus}` : '',
+    historyCalibration !== 'all' ? `kalibrasi: ${historyCalibration}` : '',
+  ].filter(Boolean).join(' · ') || 'Semua data riwayat';
+
   const body = rows.map((row, index) => `<tr><td>${index + 1}</td><td>${escape(when(row.capturedAt))}</td><td>${escape(row.visitorName)}</td><td><code class="rfid-badge">${escape(row.memberRfid || '—')}</code></td><td>${fmt(row.heightCm)}</td><td>${fmt(row.distanceCm)}</td><td>${row.buzzerAlarm ? 'Ambang &lt; 100 cm' : 'Normal'}</td><td>${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</td></tr>`).join('');
   printWindow.document.write(`<!doctype html><html lang="id"><head><meta charset="utf-8"><title>Laporan Pengukuran COCOMANG</title><style>
     @page{size:A4;margin:16mm}*{box-sizing:border-box}body{font:11px Arial,sans-serif;color:#243c32;margin:0}h1{font-family:Georgia,serif;font-size:22px;font-weight:600;margin:2px 0 4px}p{color:#59675d;line-height:1.5;margin:0}.brandline{display:flex;align-items:baseline;gap:10px;border-top:3px solid #254b3e;padding-top:12px}.brandline strong{font-size:16px;letter-spacing:.08em}.brandline span{font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:#59675d}.meta{border-bottom:1px solid #b9c1ad;padding-bottom:12px;margin-bottom:14px}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0}.summary div{border:1px solid #cbd3c5;padding:9px 10px}.summary span{display:block;color:#59675d;font-size:8px;text-transform:uppercase;letter-spacing:.06em}.summary strong{display:block;font-size:17px;margin-top:4px}table{width:100%;border-collapse:collapse;margin-top:12px}th,td{border-bottom:1px solid #cbd3c5;padding:7px 6px;text-align:left;font-size:9px}th{background:#eef0e7;font-size:8px;text-transform:uppercase;letter-spacing:.05em}td:nth-child(1),td:nth-child(5),td:nth-child(6){font-variant-numeric:tabular-nums}.rfid-badge{display:inline-block;padding:1px 5px;font-family:monospace;font-size:8.5px;background:#eef0e7;border:1px solid #cbd3c5;border-radius:3px}.foot{margin-top:18px;font-size:9px;color:#657064;border-top:1px solid #cbd3c5;padding-top:8px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
-    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan Member</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui Web Serial</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Member</th><th>UID RFID</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe dan bukan sertifikat alat ukur kesehatan.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
+    </style></head><body><div class="brandline"><strong>COCOMANG</strong><span>Smart Height Measurement System</span></div><div class="meta"><h1>Laporan Pengukuran Tinggi Badan Member</h1><p>${escape(filters)}<br>Dicetak ${escape(when(new Date().toISOString()))} WIB · sumber data: ESP32 / HC-SR04 melalui MQTT Cloud</p></div><div class="summary"><div><span>Total pengukuran</span><strong>${rows.length}</strong></div><div><span>Rata-rata tinggi</span><strong>${fmt(average)} cm</strong></div><div><span>Rentang tinggi</span><strong>${fmt(min)}–${fmt(max)} cm</strong></div><div><span>Terkalibrasi</span><strong>${calibratedCount}/${rows.length}</strong></div></div><table><thead><tr><th>No.</th><th>Waktu</th><th>Member</th><th>UID RFID</th><th>Tinggi (cm)</th><th>Jarak (cm)</th><th>Status</th><th>Kalibrasi</th></tr></thead><tbody>${body}</tbody></table><p class="foot">Laporan dibuat dari data pengukuran yang tersimpan pada peramban ini. Hasil merupakan estimasi prototipe.</p><script>window.addEventListener('load',()=>setTimeout(()=>window.print(),250));<\/script></body></html>`);
   printWindow.document.close();
 }
 
 function showHelp() {
-  openModal('Petunjuk perangkat & Supabase', 'Koneksi, Dual RFID, dan integrasi cloud COCOMANG.', `<ul class="help-list">
-    <li>Gunakan Chrome atau Edge versi desktop melalui <strong>http://localhost:8000</strong> atau HTTPS.</li>
-    <li>Tutup Serial Monitor Arduino IDE sebelum menekan Hubungkan ESP32. Baud rate 115200.</li>
-    <li><strong>Dual RFID:</strong> Reader 1 untuk pendaftaran member baru, Reader 2 untuk validasi akses wahana.</li>
-    <li><strong>Buzzer Pasif:</strong> Menghasilkan 1x bip saat lolos syarat wahana, dan 3x bip saat tinggi badan kurang.</li>
-    <li><strong>Supabase PostgreSQL:</strong> Klik tombol status Supabase di header untuk mengisi URL & Anon Key.</li>
-    <li>Data tetap aman tersimpan lokal di browser meskipun tidak ada koneksi internet.</li>
+  openModal('Petunjuk Sistem & MQTT Cloud', 'Komunikasi nirkabel, Dual RFID, dan integrasi cloud COCOMANG.', `<ul class="help-list">
+    <li><strong>Komunikasi MQTT Nirkabel:</strong> ESP32 terhubung ke Wi-Fi dan mengirim telemetri ke Cloud Broker (default: <code>broker.emqx.io</code> via WSS).</li>
+    <li><strong>Dual RFID:</strong> Reader 1 untuk pendaftaran member di pos ukur, Reader 2 untuk validasi akses di loket wahana.</li>
+    <li><strong>Buzzer Dua Arah:</strong> Menghasilkan 1x bip saat lolos syarat wahana, dan 3x bip saat syarat tidak terpenuhi via perintah MQTT.</li>
+    <li><strong>Multi-Device:</strong> Pos pendaftaran dan Loket Wahana (Kiosk) dapat dibuka di perangkat berbeda secara bersamaan melalui internet.</li>
+    <li><strong>Supabase PostgreSQL:</strong> Kredensial cloud database menyinkronkan data member antar-perangkat secara instan.</li>
     </ul><div class="modal-actions"><button class="btn primary" data-action="close-modal">Mengerti</button></div>`);
 }
 
@@ -923,6 +921,7 @@ document.addEventListener('click', event => {
   const button = event.target.closest('[data-action]');
   if (!button || button.disabled) return;
   const action = button.dataset.action;
+
   if (action === 'add-member' || action === 'add-visitor') memberForm();
   else if (action === 'delete-member') {
     const id = button.dataset.id;
@@ -942,17 +941,11 @@ document.addEventListener('click', event => {
       toast(err.message, true);
     }
   }
-  else if (action === 'toggle-serial') {
-    if (serialSession) {
-      if (confirm('Putuskan koneksi serial ESP32?')) {
-        void disconnectDevice();
-      }
-    } else {
-      void connectDevice();
-    }
+  else if (action === 'open-mqtt-settings') openMqttModal();
+  else if (action === 'reconnect-mqtt') {
+    toast('Menghubungkan ulang ke broker MQTT…');
+    void connectMqtt();
   }
-  else if (action === 'connect') void connectDevice();
-  else if (action === 'disconnect') void disconnectDevice();
   else if (action === 'save-reading') {
     try { void saveLiveReading(); } catch (error) { toast(error.message, true); }
   }
@@ -967,7 +960,7 @@ document.addEventListener('click', event => {
   else if (action === 'open-db-settings') void openSupabaseModal();
   else if (action === 'export-csv') exportMeasurementsCsv();
   else if (action === 'print-pdf') printPdfReport();
-  else if (action === 'clear-filter') { historyFrom = ''; historyTo = ''; historySearch = ''; historyStatus = 'all'; historyCalibration = 'all'; historySort = 'newest'; render(); }
+  else if (action === 'clear-filter') { historyFrom = ''; historyTo = ''; historySearch = ''; historyStatus = 'all'; historyCalibration = 'all'; historySort = 'newest'; renderHistoryTable(); }
   else if (action === 'help') showHelp();
   else if (action === 'close-modal') modal.close();
 });
@@ -990,7 +983,7 @@ window.addEventListener('storage', event => {
 });
 
 setInterval(() => {
-  if (serialSession) updateConnectionUI();
+  updateConnectionUI();
 }, 1000);
 
 async function initCloudData() {
@@ -1001,7 +994,6 @@ async function initCloudData() {
 
     const remoteMembers = await fetchSupabaseMembers();
     if (remoteMembers?.length) {
-      // Sinkronkan remote member ke local repository jika belum ada
       commit(next => {
         for (const rm of remoteMembers) {
           if (!next.visitors.some(local => local.rfidUid && normalizeRfid(local.rfidUid) === normalizeRfid(rm.rfidUid))) {
@@ -1039,6 +1031,25 @@ async function initCloudData() {
   }
 }
 
+function initMqtt() {
+  onMqttConnection(() => {
+    updateConnectionUI();
+  });
+  onDeviceStatusChange(() => {
+    updateConnectionUI();
+  });
+  onTelemetry(frame => {
+    latestFrame = frame;
+    lastFrameAt = Date.now();
+    updateConnectionUI();
+  });
+  onRfidReader1(rfidEvent => {
+    handleRfidEventReader1(rfidEvent);
+  });
+
+  void connectMqtt();
+}
+
 async function boot() {
   try {
     state = repository.load();
@@ -1058,6 +1069,7 @@ async function boot() {
     }
 
     render();
+    initMqtt();
   } catch (error) {
     $('#app').innerHTML = `<main class="boot"><div><h1>Data belum dapat dibuka</h1><p>${escape(error.message)}</p></div></main>`;
   }

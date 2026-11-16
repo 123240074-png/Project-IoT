@@ -7,3 +7,4 @@ Thumbs.db
 .env
 *.env
 .env.local
+cocomang/firmware/smartheight_mqtt/config.h
