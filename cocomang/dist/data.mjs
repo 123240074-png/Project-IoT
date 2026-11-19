@@ -126,7 +126,7 @@ export function validateDeviceFrame(frame) {
   if (!isFiniteNumber(frame.heightCm) || frame.heightCm < 0 || frame.heightCm > 250) return 'Estimasi tinggi di luar rentang valid.';
   if (!isFiniteNumber(frame.referenceHeightCm) || frame.referenceHeightCm < 50 || frame.referenceHeightCm > 400) return 'Tinggi referensi perangkat tidak valid.';
   if (!isFiniteNumber(frame.offsetCm) || frame.offsetCm < -20 || frame.offsetCm > 20) return 'Offset kalibrasi perangkat tidak valid.';
-  if (!Number.isInteger(frame.validSamples) || frame.validSamples < 3 || frame.validSamples > 5) return 'Jumlah sampel valid perangkat tidak sesuai.';
+  if (!Number.isInteger(frame.validSamples) || frame.validSamples < 3 || frame.validSamples > 20) return 'Jumlah sampel valid perangkat tidak sesuai.';
   if (typeof frame.buzzerAlarm !== 'boolean') return 'Status buzzer tidak valid.';
   if (typeof frame.calibrated !== 'boolean') return 'Status kalibrasi tidak tersedia.';
   return null;
@@ -199,7 +199,7 @@ function assertState(state) {
     if (typeof entry.visitorName !== 'string' || !entry.visitorName || !validDate(entry.capturedAt)) throw new Error('Riwayat pengukuran tidak valid.');
     if (![entry.distanceCm, entry.heightCm, entry.referenceHeightCm, entry.offsetCm].every(isFiniteNumber)) throw new Error('Nilai pengukuran tidak valid.');
     if (entry.distanceCm < 2 || entry.distanceCm > 400 || entry.heightCm < 0 || entry.heightCm > 250) throw new Error('Rentang pengukuran tidak valid.');
-    if (!Number.isInteger(entry.validSamples) || entry.validSamples < 3 || entry.validSamples > 5 || typeof entry.buzzerAlarm !== 'boolean' || typeof entry.calibrated !== 'boolean') {
+    if (!Number.isInteger(entry.validSamples) || entry.validSamples < 3 || entry.validSamples > 20 || typeof entry.buzzerAlarm !== 'boolean' || typeof entry.calibrated !== 'boolean') {
       throw new Error('Metadata pengukuran tidak valid.');
     }
   }

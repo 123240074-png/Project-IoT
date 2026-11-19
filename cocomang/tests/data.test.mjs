@@ -179,3 +179,30 @@ test('deleteMember removes member by id or rfidUid and prevents deleting unknown
   // Delete non-existent
   assert.throws(() => deleteMember(state, 'unknown-id'), /Member tidak ditemukan/);
 });
+
+test('accepts and persists calibrated 20-sample median telemetry frame', () => {
+  const state = createInitialState();
+  const member = addMember(state, { name: 'Member Kalibrasi', rfidUid: 'AA:BB:CC:DD' });
+  const calibratedFrame = {
+    type: 'measurement',
+    device: 'smartheight-esp32',
+    sequence: 11,
+    status: 'ok',
+    distanceCm: 40.0,
+    heightCm: 170.0,
+    referenceHeightCm: 200,
+    offsetCm: 10,
+    validSamples: 20,
+    buzzerAlarm: false,
+    calibrated: true,
+  };
+  assert.equal(validateDeviceFrame(calibratedFrame), null);
+  const entry = recordMeasurement(state, member.id, calibratedFrame);
+  assert.equal(entry.calibrated, true);
+  assert.equal(entry.validSamples, 20);
+  assert.equal(entry.heightCm, 170.0);
+  repository.save(state);
+  const loaded = repository.load();
+  assert.equal(loaded.measurements[0].validSamples, 20);
+  assert.equal(loaded.measurements[0].calibrated, true);
+});

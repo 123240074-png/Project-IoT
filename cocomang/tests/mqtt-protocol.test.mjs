@@ -6,6 +6,7 @@ import {
   parseTelemetryMessage,
   parseRfidMessage,
   buildBuzzerPayload,
+  buildMeasurePayload,
 } from '../dist/mqtt-protocol.mjs';
 
 const sampleTelemetry = {
@@ -28,6 +29,7 @@ test('generates correct hierarchical MQTT topics', () => {
   assert.equal(topics.rfidReader1, 'cocomang/rfid/reader1');
   assert.equal(topics.rfidReader2, 'cocomang/rfid/reader2');
   assert.equal(topics.buzzerCmd, 'cocomang/cmd/buzzer');
+  assert.equal(topics.measureCmd, 'cocomang/cmd/measure');
   assert.equal(topics.deviceStatus, 'cocomang/status');
 
   const defaultTopics = getMqttTopics();
@@ -95,4 +97,26 @@ test('validates buzzer command payload builder', () => {
   assert.equal(buildBuzzerPayload('N'), 'n');
   assert.equal(buildBuzzerPayload('x'), null);
   assert.equal(buildBuzzerPayload(''), null);
+});
+
+test('validates measure command payload builder and calibrated 20-sample telemetry', () => {
+  assert.equal(buildMeasurePayload(), 'start');
+  assert.equal(buildMeasurePayload('start'), 'start');
+  assert.equal(buildMeasurePayload('measure'), 'start');
+  assert.equal(buildMeasurePayload('Y'), 'start');
+  assert.equal(buildMeasurePayload('invalid'), null);
+
+  const calibratedPayload = JSON.stringify({
+    ...sampleTelemetry,
+    referenceHeightCm: 200,
+    offsetCm: 10,
+    validSamples: 20,
+    calibrated: true,
+  });
+  const parsed = parseTelemetryMessage(calibratedPayload);
+  assert.notEqual(parsed, null);
+  assert.equal(parsed.status, 'ok');
+  assert.equal(parsed.calibrated, true);
+  assert.equal(parsed.validSamples, 20);
+  assert.equal(parsed.offsetCm, 10);
 });

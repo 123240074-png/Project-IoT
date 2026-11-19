@@ -1,17 +1,29 @@
 /*
-  SMART HEIGHT MEASUREMENT SYSTEM - PURE MQTT WIRELESS EDITION
+  SMART HEIGHT MEASUREMENT SYSTEM - PURE MQTT WIRELESS EDITION (CALIBRATED ON-DEMAND)
   ESP32 DevKit V1 + Dual RFID RC522 (VSPI & HSPI) + HC-SR04 + Buzzer Pasif
-  
+
+  Perubahan pada versi ini (pengukuran tinggi badan terkalibrasi):
+  - Tinggi referensi (jarak sensor ke lantai) tetap 200 cm (REFERENCE_HEIGHT_CM).
+  - Data tinggi badan TIDAK dikirim ke MQTT secara realtime/periodik.
+  - Pengukuran & kalibrasi dipicu oleh tombol "Ukur Tinggi Badan" dari website
+    melalui topik MQTT <MQTT_TOPIC_PREFIX>/cmd/measure (atau perintah Serial 'y').
+  - Saat dipicu, ESP32 mengambil 20 sampel valid, menghitung MEDIAN, lalu
+    memverifikasi kestabilan data (rentang IQR <= 5 cm & rentang tinggi valid).
+  - Data hanya dipublish ke MQTT (<MQTT_TOPIC_PREFIX>/telemetry) setelah
+    terkalibrasi dan terverifikasi sesuai (calibrated: true).
+
   Arsitektur Komunikasi:
   - ESP32 terhubung ke Wi-Fi dan MQTT Cloud Broker (default: broker.emqx.io:1883).
-  - Mengirim telemetri ultrasonik periodik ke topik: <MQTT_TOPIC_PREFIX>/telemetry
+  - Mengirim hasil pengukuran terkalibrasi ke topik: <MQTT_TOPIC_PREFIX>/telemetry
   - Mengirim deteksi kartu RFID 1 (Pendaftaran) ke topik: <MQTT_TOPIC_PREFIX>/rfid/reader1
   - Mengirim deteksi kartu RFID 2 (Akses Wahana) ke topik: <MQTT_TOPIC_PREFIX>/rfid/reader2
   - Mengirim status LWT (online/offline) ke topik: <MQTT_TOPIC_PREFIX>/status
+  - Menerima perintah ukur & kalibrasi dari website di topik: <MQTT_TOPIC_PREFIX>/cmd/measure
+      "start" / "measure" / "y" : Mulai pengambilan 20 sampel + median + verifikasi
   - Menerima perintah suara buzzer dari dashboard di topik: <MQTT_TOPIC_PREFIX>/cmd/buzzer
       'b' : Bunyi 1 bip pendek (200 ms) - konfirmasi sukses/lolos
       'n' : Bunyi 3 bip peringatan (100 ms per bip) - peringatan/ditolak
-  
+
   Wiring Hardware:
   - RFID 1 (Pendaftaran Member): Bus VSPI
       SCK  -> GPIO 18, MISO -> GPIO 19, MOSI -> GPIO 23, SS -> GPIO 5, RST -> GPIO 22
@@ -59,16 +71,39 @@ static const uint16_t BUZZER_FREQ_HZ = 2000;
 static const uint32_t SENSOR_TIMEOUT_US = 30000UL;
 static const float MIN_DISTANCE_CM = 2.0f;
 static const float MAX_DISTANCE_CM = 400.0f;
-static const uint32_t ULTRASONIC_INTERVAL_MS = 500;
-static const uint32_t RFID_POLL_INTERVAL_MS   = 100;
-static const uint32_t RFID_COOLDOWN_MS        = 1500;
+static const uint32_t ULTRASONIC_SAMPLE_INTERVAL_MS = 100;  // satu sampel tiap 100 ms
+static const uint32_t RFID_POLL_INTERVAL_MS         = 100;
+static const uint32_t RFID_COOLDOWN_MS              = 1500;
 
-// Jarak sensor ke lantai (default: 220 cm)
-static const float REFERENCE_HEIGHT_CM = 220.0f;
+// --- Parameter pengukuran & kalibrasi tinggi badan ---
+static const float   REFERENCE_HEIGHT_CM    = 200.0f; // jarak sensor ke lantai (tetap)
+static const float   HEIGHT_CALIB_OFFSET_CM = 10.0f;  // koreksi kalibrasi (+10 cm)
+static const float   MIN_PERSON_HEIGHT_CM   = 50.0f;  // di bawah ini dianggap bukan orang
+static const float   MAX_PERSON_HEIGHT_CM   = 250.0f; // batas atas tinggi valid
+static const float   FINAL_MAX_IQR_CM       = 5.0f;   // batas kestabilan IQR (Q3 - Q1) agar terverifikasi
+static const uint8_t MEDIAN_WINDOW          = 5;      // jumlah sampel untuk filter median singkat
+static const uint8_t INVALID_STREAK_LIMIT   = 3;      // bacaan gagal beruntun sebelum dianggap invalid
+static const uint8_t  FINAL_SAMPLES         = 20;     // jumlah sampel untuk kalibrasi median
+static const uint32_t FINAL_TIMEOUT_MS      = 10000;  // batas waktu pengumpulan 20 sampel
 
 static float latestDistanceCm = NAN;
 static float latestEstimatedHeightCm = NAN;
-static uint32_t lastUltrasonicMs = 0;
+static bool  personPresent = false;
+
+// State filter median singkat
+static float   distBuf[MEDIAN_WINDOW];
+static uint8_t distCount = 0;
+static uint8_t distIdx = 0;
+static uint8_t invalidStreak = 0;
+
+// State pengukuran & kalibrasi final (median 20 sampel)
+static bool     finalActive  = false;
+static uint8_t  finalCount   = 0;
+static float    finalHeightSamples[FINAL_SAMPLES];
+static float    finalDistSamples[FINAL_SAMPLES];
+static uint32_t finalStartMs = 0;
+
+static uint32_t lastSampleMs     = 0;
 static uint32_t lastRfidMs       = 0;
 static uint32_t lastRfid1ReadMs  = 0;
 static uint32_t lastRfid2ReadMs  = 0;
@@ -81,6 +116,7 @@ static char topicTelemetry[80];
 static char topicRfid1[80];
 static char topicRfid2[80];
 static char topicCmdBuzzer[80];
+static char topicCmdMeasure[80];
 static char topicStatus[80];
 
 // Inisialisasi Klien Jaringan
@@ -405,6 +441,165 @@ bool readUltrasonicDistance(float &distanceCm) {
   return (distanceCm >= MIN_DISTANCE_CM && distanceCm <= MAX_DISTANCE_CM);
 }
 
+// Forward declarations untuk publikasi MQTT hasil kalibrasi
+void publishCalibratedTelemetry(float dist, float height, uint8_t samples, bool alarm);
+void publishInvalidTelemetry(const char* errorMsg);
+
+// Urutkan array float (ascending) untuk perhitungan median & kuartil
+void sortFloatArray(float* arr, uint8_t len) {
+  for (uint8_t i = 0; i + 1 < len; i++) {
+    for (uint8_t j = i + 1; j < len; j++) {
+      if (arr[j] < arr[i]) {
+        float t = arr[i];
+        arr[i] = arr[j];
+        arr[j] = t;
+      }
+    }
+  }
+}
+
+// Median dari sampel terakhir di buffer singkat (membuang outlier sesaat)
+float medianOfBuffer() {
+  float tmp[MEDIAN_WINDOW];
+  for (uint8_t i = 0; i < distCount; i++) tmp[i] = distBuf[i];
+  sortFloatArray(tmp, distCount);
+  return tmp[distCount / 2];
+}
+
+void startFinalMeasurement() {
+  // Reset buffer agar 20 sampel benar-benar baru untuk sesi ukur saat ini
+  distCount     = 0;
+  distIdx       = 0;
+  invalidStreak = 0;
+  personPresent = false;
+  latestDistanceCm = NAN;
+  latestEstimatedHeightCm = NAN;
+
+  finalActive  = true;
+  finalCount   = 0;
+  finalStartMs = millis();
+  lastSampleMs = finalStartMs;
+  Serial.printf("[KALIBRASI] Memulai pengukuran (%u sampel median). Mohon berdiri diam di bawah sensor...\n",
+                (unsigned)FINAL_SAMPLES);
+}
+
+void abortFinalMeasurement(const char* reason) {
+  if (!finalActive) return;
+  finalActive = false;
+  Serial.printf("[KALIBRASI] GAGAL: %s (terkumpul %u/%u sampel)\n",
+                reason, (unsigned)finalCount, (unsigned)FINAL_SAMPLES);
+  publishInvalidTelemetry(reason);
+  buzzerBeepTriple();
+}
+
+// Dipanggil tiap ada sampel valid saat mode pengukuran & kalibrasi aktif
+void collectFinalSample(float distCm, float heightCm) {
+  if (!finalActive) return;
+
+  finalDistSamples[finalCount]   = distCm;
+  finalHeightSamples[finalCount] = heightCm;
+  finalCount++;
+
+  if (finalCount >= FINAL_SAMPLES) {
+    finalActive = false;
+
+    float sortedHeights[FINAL_SAMPLES];
+    float sortedDists[FINAL_SAMPLES];
+    for (uint8_t i = 0; i < FINAL_SAMPLES; i++) {
+      sortedHeights[i] = finalHeightSamples[i];
+      sortedDists[i]   = finalDistSamples[i];
+    }
+    sortFloatArray(sortedHeights, FINAL_SAMPLES);
+    sortFloatArray(sortedDists, FINAL_SAMPLES);
+
+    // Hitung median (untuk 20 sampel genap: rata-rata indeks 9 dan 10)
+    const float medianHeight = (sortedHeights[FINAL_SAMPLES / 2 - 1] + sortedHeights[FINAL_SAMPLES / 2]) / 2.0f;
+    const float medianDist   = (sortedDists[FINAL_SAMPLES / 2 - 1] + sortedDists[FINAL_SAMPLES / 2]) / 2.0f;
+
+    // Hitung IQR (Q3 - Q1) untuk verifikasi kestabilan data tinggi badan
+    const float q1  = sortedHeights[FINAL_SAMPLES / 4];
+    const float q3  = sortedHeights[(FINAL_SAMPLES * 3) / 4];
+    const float iqr = q3 - q1;
+
+    Serial.printf("[KALIBRASI] Selesai %u sampel | min: %.1f | median: %.1f | max: %.1f | IQR: %.2f cm\n",
+                  (unsigned)FINAL_SAMPLES, sortedHeights[0], medianHeight, sortedHeights[FINAL_SAMPLES - 1], iqr);
+
+    // Verifikasi hasil kalibrasi sebelum dikirim ke MQTT
+    const bool rangeValid = (medianHeight >= MIN_PERSON_HEIGHT_CM && medianHeight <= MAX_PERSON_HEIGHT_CM)
+                         && (medianDist >= MIN_DISTANCE_CM && medianDist <= MAX_DISTANCE_CM);
+    const bool stableValid = (iqr <= FINAL_MAX_IQR_CM);
+
+    if (!rangeValid) {
+      Serial.println(F("[KALIBRASI] DITOLAK: Nilai tinggi/jarak di luar rentang valid."));
+      publishInvalidTelemetry("Tinggi badan di luar rentang valid");
+      buzzerBeepTriple();
+      return;
+    }
+
+    if (!stableValid) {
+      Serial.printf("[KALIBRASI] DITOLAK: Pembacaan tidak stabil (IQR %.2f cm > %.1f cm).\n", iqr, FINAL_MAX_IQR_CM);
+      publishInvalidTelemetry("Pembacaan tidak stabil, mohon berdiri diam dan ulangi");
+      buzzerBeepTriple();
+      return;
+    }
+
+    latestDistanceCm = medianDist;
+    latestEstimatedHeightCm = medianHeight;
+    const bool alarm = (medianHeight < 100.0f);
+
+    Serial.printf("[KALIBRASI] TERVERIFIKASI -> Mengirim ke MQTT: %.1f cm (jarak: %.1f cm)\n",
+                  medianHeight, medianDist);
+    publishCalibratedTelemetry(medianDist, medianHeight, FINAL_SAMPLES, alarm);
+    buzzerBeepSingle();
+  }
+}
+
+void resetMeasurementWindow() {
+  abortFinalMeasurement("Pembacaan sensor terputus");
+  distCount = 0;
+  distIdx = 0;
+  personPresent = false;
+  latestDistanceCm = NAN;
+  latestEstimatedHeightCm = NAN;
+}
+
+// Dipanggil tiap ULTRASONIC_SAMPLE_INTERVAL_MS hanya saat sesi pengukuran aktif
+void updateMeasurement() {
+  float d = 0.0f;
+  if (!readUltrasonicDistance(d)) {
+    if (++invalidStreak >= INVALID_STREAK_LIMIT) {
+      resetMeasurementWindow();
+    }
+    return;
+  }
+  invalidStreak = 0;
+
+  // Masukkan ke ring buffer median singkat
+  distBuf[distIdx] = d;
+  distIdx = (distIdx + 1) % MEDIAN_WINDOW;
+  if (distCount < MEDIAN_WINDOW) distCount++;
+  if (distCount < 3) return;  // belum cukup sampel awal
+
+  const float m = medianOfBuffer();
+  latestDistanceCm = m;
+
+  const float diff = REFERENCE_HEIGHT_CM - m;  // tinggi objek dari lantai (tanpa offset)
+
+  if (diff >= MIN_PERSON_HEIGHT_CM) {
+    personPresent = true;
+    const float height = REFERENCE_HEIGHT_CM - m + HEIGHT_CALIB_OFFSET_CM;
+    latestEstimatedHeightCm = height;
+    collectFinalSample(m, height);
+  } else {
+    // Jika orang sudah sempat terdeteksi lalu pergi sebelum 20 sampel, gagalkan
+    if (personPresent && finalCount > 0) {
+      abortFinalMeasurement("Orang meninggalkan area sensor sebelum kalibrasi selesai");
+    }
+    personPresent = false;
+    latestEstimatedHeightCm = 0.0f;
+  }
+}
+
 void formatUidString(const MFRC522_DualSPI::Uid &uid, char* outBuffer, size_t maxLen) {
   size_t offset = 0;
   for (uint8_t i = 0; i < uid.size && offset + 3 < maxLen; i++) {
@@ -416,13 +611,29 @@ void formatUidString(const MFRC522_DualSPI::Uid &uid, char* outBuffer, size_t ma
 // CALLBACK & RECONNECT MQTT
 // ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, topicCmdBuzzer) == 0 && length > 0) {
+  if (length == 0) return;
+
+  if (strcmp(topic, topicCmdBuzzer) == 0) {
     char cmd = (char)payload[0];
     Serial.printf("[MQTT CMD] Perintah buzzer diterima: '%c'\n", cmd);
     if (cmd == 'b' || cmd == 'B') {
       buzzerBeepSingle();
     } else if (cmd == 'n' || cmd == 'N') {
       buzzerBeepTriple();
+    }
+    return;
+  }
+
+  if (strcmp(topic, topicCmdMeasure) == 0) {
+    char msg[24];
+    unsigned int copyLen = (length < sizeof(msg) - 1) ? length : (sizeof(msg) - 1);
+    memcpy(msg, payload, copyLen);
+    msg[copyLen] = '\0';
+    Serial.printf("[MQTT CMD] Perintah ukur tinggi badan diterima: '%s'\n", msg);
+
+    if (strcmp(msg, "start") == 0 || strcmp(msg, "measure") == 0 ||
+        msg[0] == 'y' || msg[0] == 'Y' || msg[0] == '1') {
+      startFinalMeasurement();
     }
   }
 }
@@ -443,7 +654,8 @@ bool connectMqttBroker() {
     Serial.println(F("[MQTT] Terhubung ke Cloud Broker!"));
     mqttClient.publish(topicStatus, "online", true);
     mqttClient.subscribe(topicCmdBuzzer);
-    Serial.printf("[MQTT] Berlangganan ke topik: %s\n", topicCmdBuzzer);
+    mqttClient.subscribe(topicCmdMeasure);
+    Serial.printf("[MQTT] Berlangganan ke topik: %s & %s\n", topicCmdBuzzer, topicCmdMeasure);
     buzzerBeepSingle();
     return true;
   } else {
@@ -475,28 +687,44 @@ void handleNetworkReconnections(uint32_t now) {
 }
 
 // ============================================================
-// PUBLIKASI DATA TELEMETRI & EVENT RFID VIA MQTT
+// PUBLIKASI DATA TELEMETRI TERKALIBRASI & EVENT RFID VIA MQTT
 // ============================================================
-void publishTelemetryJson(float dist, float height, bool ok) {
-  char jsonBuffer[256];
-  if (ok) {
-    snprintf(
-      jsonBuffer, sizeof(jsonBuffer),
-      "{\"type\":\"measurement\",\"device\":\"smartheight-esp32\",\"sequence\":%lu,\"status\":\"ok\",\"distanceCm\":%.1f,\"heightCm\":%.1f,\"referenceHeightCm\":%.1f,\"offsetCm\":0.0,\"validSamples\":5,\"buzzerAlarm\":false,\"calibrated\":false,\"uptimeMs\":%lu}",
-      (unsigned long)(sequenceNumber++), dist, height, REFERENCE_HEIGHT_CM, (unsigned long)millis()
-    );
-  } else {
-    snprintf(
-      jsonBuffer, sizeof(jsonBuffer),
-      "{\"type\":\"measurement\",\"device\":\"smartheight-esp32\",\"sequence\":%lu,\"status\":\"invalid\",\"error\":\"Di luar rentang pantulan\",\"distanceCm\":0.0,\"heightCm\":0.0,\"referenceHeightCm\":%.1f,\"offsetCm\":0.0,\"validSamples\":0,\"buzzerAlarm\":true,\"calibrated\":false,\"uptimeMs\":%lu}",
-      (unsigned long)(sequenceNumber++), REFERENCE_HEIGHT_CM, (unsigned long)millis()
-    );
-  }
+void publishCalibratedTelemetry(float dist, float height, uint8_t samples, bool alarm) {
+  char jsonBuffer[384];
+  snprintf(
+    jsonBuffer, sizeof(jsonBuffer),
+    "{\"type\":\"measurement\",\"device\":\"smartheight-esp32\",\"sequence\":%lu,\"status\":\"ok\",\"distanceCm\":%.1f,\"heightCm\":%.1f,\"referenceHeightCm\":%.1f,\"offsetCm\":%.1f,\"validSamples\":%u,\"buzzerAlarm\":%s,\"calibrated\":true,\"uptimeMs\":%lu}",
+    (unsigned long)(sequenceNumber++),
+    dist,
+    height,
+    REFERENCE_HEIGHT_CM,
+    HEIGHT_CALIB_OFFSET_CM,
+    (unsigned)samples,
+    alarm ? "true" : "false",
+    (unsigned long)millis()
+  );
 
-  // Cetak ke Serial lokal untuk debugging
   Serial.println(jsonBuffer);
 
-  // Publish ke MQTT Broker jika terhubung
+  if (mqttClient.connected()) {
+    mqttClient.publish(topicTelemetry, jsonBuffer);
+  }
+}
+
+void publishInvalidTelemetry(const char* errorMsg) {
+  char jsonBuffer[384];
+  snprintf(
+    jsonBuffer, sizeof(jsonBuffer),
+    "{\"type\":\"measurement\",\"device\":\"smartheight-esp32\",\"sequence\":%lu,\"status\":\"invalid\",\"error\":\"%s\",\"distanceCm\":0.0,\"heightCm\":0.0,\"referenceHeightCm\":%.1f,\"offsetCm\":%.1f,\"validSamples\":0,\"buzzerAlarm\":true,\"calibrated\":false,\"uptimeMs\":%lu}",
+    (unsigned long)(sequenceNumber++),
+    errorMsg,
+    REFERENCE_HEIGHT_CM,
+    HEIGHT_CALIB_OFFSET_CM,
+    (unsigned long)millis()
+  );
+
+  Serial.println(jsonBuffer);
+
   if (mqttClient.connected()) {
     mqttClient.publish(topicTelemetry, jsonBuffer);
   }
@@ -541,6 +769,7 @@ void setup() {
   snprintf(topicRfid1, sizeof(topicRfid1), "%s/rfid/reader1", MQTT_TOPIC_PREFIX);
   snprintf(topicRfid2, sizeof(topicRfid2), "%s/rfid/reader2", MQTT_TOPIC_PREFIX);
   snprintf(topicCmdBuzzer, sizeof(topicCmdBuzzer), "%s/cmd/buzzer", MQTT_TOPIC_PREFIX);
+  snprintf(topicCmdMeasure, sizeof(topicCmdMeasure), "%s/cmd/measure", MQTT_TOPIC_PREFIX);
   snprintf(topicStatus, sizeof(topicStatus), "%s/status", MQTT_TOPIC_PREFIX);
 
   // 2. Inisialisasi Hardware
@@ -578,6 +807,7 @@ void setup() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   // 5. Inisialisasi Klien MQTT
+  mqttClient.setBufferSize(512);
   mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
   mqttClient.setCallback(mqttCallback);
 
@@ -600,6 +830,8 @@ void loop() {
       uint8_t v2 = rfid2.getFirmwareVersion();
       Serial.printf("  RFID 1 (VSPI - Pendaftaran) : Version 0x%02X -> %s\n", v1, (v1 != 0x00 && v1 != 0xFF) ? "OK" : "ERROR (Cek Pin/Kabel)");
       Serial.printf("  RFID 2 (HSPI - Akses Wahana): Version 0x%02X -> %s\n", v2, (v2 != 0x00 && v2 != 0xFF) ? "OK" : "ERROR (Cek Pin MISO 32 / RST 21)");
+    } else if (cmd == 'y' || cmd == 'Y') {
+      startFinalMeasurement();    // mulai kalibrasi median 20 sampel
     } else if (cmd == 'b' || cmd == 'B') {
       buzzerBeepSingle();
     } else if (cmd == 'n' || cmd == 'N') {
@@ -635,21 +867,17 @@ void loop() {
     }
   }
 
-  // 3. PEMBACAAN PERIODIK SENSOR ULTRASONIK (500 ms)
-  if (now - lastUltrasonicMs >= ULTRASONIC_INTERVAL_MS) {
-    lastUltrasonicMs = now;
+  // 4. SAMPLING & KALIBRASI SENSOR ULTRASONIK ON-DEMAND (100 ms)
+  // Data tidak dikirim realtime; hanya dikirim ke MQTT setelah 20 sampel median terverifikasi.
+  if (finalActive) {
+    const uint32_t sampleNow = millis();
+    if (sampleNow - lastSampleMs >= ULTRASONIC_SAMPLE_INTERVAL_MS) {
+      lastSampleMs = sampleNow;
+      updateMeasurement();
+    }
 
-    float currentDistance = 0.0f;
-    if (readUltrasonicDistance(currentDistance)) {
-      latestDistanceCm = currentDistance;
-      latestEstimatedHeightCm = REFERENCE_HEIGHT_CM - currentDistance;
-      if (latestEstimatedHeightCm < 0.0f) latestEstimatedHeightCm = 0.0f;
-
-      publishTelemetryJson(latestDistanceCm, latestEstimatedHeightCm, true);
-    } else {
-      latestDistanceCm = NAN;
-      latestEstimatedHeightCm = NAN;
-      publishTelemetryJson(0.0f, 0.0f, false);
+    if (finalActive && (millis() - finalStartMs) > FINAL_TIMEOUT_MS) {
+      abortFinalMeasurement("Waktu habis, orang tidak terdeteksi di bawah sensor");
     }
   }
 

@@ -12,6 +12,7 @@ import {
   onRfidReader1,
   onDeviceStatusChange,
   sendBuzzerCommand,
+  sendMeasureCommand,
 } from './mqtt-service.mjs';
 import {
   loadEnvConfig,
@@ -43,6 +44,7 @@ const icon = name => ({
   database:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
   alert:'<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>',
   mqtt:'<path d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/>',
+  ruler:'<path d="M16 3h5v18h-5zM16 7h2.5M16 11h3.5M16 15h2.5M7 3v18M4 6l3-3 3 3M4 18l3 3 3-3"/>',
   settings:'<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83 2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
 }[name] || '<circle cx="12" cy="12" r="9"/>');
 const svg = name => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icon(name)}</svg>`;
@@ -70,6 +72,9 @@ let latestFrame = null;
 let lastFrameAt = 0;
 let lastSavedSequence = null;
 let lastScannedRfid = '';
+let measureState = 'idle'; // 'idle' | 'measuring' | 'calibrated' | 'error'
+let measureError = '';
+let measureTimeoutId = null;
 let toastTimer;
 let historyFrom = '';
 let historyTo = '';
@@ -134,11 +139,11 @@ function setStatus(id, label, tone, note = '') {
 }
 
 function frameNow() {
-  return latestFrame?.status === 'ok' ? latestFrame : null;
+  return latestFrame?.status === 'ok' && latestFrame?.calibrated === true ? latestFrame : null;
 }
 
 function isLive() {
-  return Boolean(lastFrameAt && Date.now() - lastFrameAt <= 3000);
+  return getConnectionState() === 'connected' && getDeviceStatus() === 'online';
 }
 
 function mqttBrokerPill() {
@@ -156,14 +161,14 @@ function mqttBrokerPill() {
 
 function statusPill() {
   const conn = getConnectionState();
-  const live = isLive();
+  const online = isLive();
   if (conn !== 'connected') {
     return `<button type="button" class="pill offline" data-action="open-mqtt-settings" title="Broker MQTT terputus. Klik untuk memeriksa pengaturan koneksi."><i></i><span>Offline</span></button>`;
   }
-  if (!live) {
-    return `<button type="button" class="pill waiting" data-action="reconnect-mqtt" title="Broker terhubung, menunggu telemetri dari ESP32."><i></i><span>Menunggu data</span></button>`;
+  if (!online) {
+    return `<button type="button" class="pill waiting" data-action="reconnect-mqtt" title="Broker terhubung, menunggu status online ESP32."><i></i><span>Menunggu ESP32</span></button>`;
   }
-  return `<button type="button" class="pill online" data-action="open-mqtt-settings" title="ESP32 Live via MQTT. Klik untuk opsi koneksi."><i></i><span>ESP32 Live</span></button>`;
+  return `<button type="button" class="pill online" data-action="open-mqtt-settings" title="ESP32 Siap via MQTT (mode kalibrasi on-demand). Klik untuk opsi koneksi."><i></i><span>ESP32 Siap</span></button>`;
 }
 
 function cloudPill() {
@@ -178,51 +183,75 @@ function cloudPill() {
 function connectionInfo() {
   const conn = getConnectionState();
   if (conn !== 'connected') return { label:'Terputus', tone:'offline' };
-  if (!isLive()) return { label:'Siaga', tone:'waiting' };
-  return { label:'Live (MQTT)', tone:'online' };
+  if (!isLive()) return { label:'Menunggu ESP32', tone:'waiting' };
+  return { label:'Siap (MQTT)', tone:'online' };
 }
 
 function sensorInfo() {
   const conn = getConnectionState();
   if (conn !== 'connected') return { label:'Tidak aktif', tone:'waiting' };
-  if (!lastFrameAt) return { label:'Menunggu echo', tone:'waiting' };
-  if (Date.now() - lastFrameAt > 3000) return { label:'Data kedaluwarsa', tone:'waiting' };
-  if (latestFrame?.status === 'invalid') return { label:'Echo tidak valid', tone:'alarm' };
-  return { label:'Echo valid', tone:'good' };
+  if (measureState === 'measuring') return { label:'Mengukur 20 sampel...', tone:'waiting' };
+  if (measureState === 'error' || latestFrame?.status === 'invalid') return { label:'Gagal verifikasi', tone:'alarm' };
+  if (frameNow()) return { label:'Terkalibrasi', tone:'good' };
+  return { label:'Siaga (klik ukur)', tone:'waiting' };
 }
 
 function calibrationInfo(frame) {
-  if (!frame) return { label:'Belum ada status', tone:'waiting', note:'Menunggu pembacaan perangkat.' };
-  if (frame.calibrated) return { label:'Terkalibrasi', tone:'good', note:'Offset kalibrasi telah dikonfirmasi firmware.' };
-  if (frame.offsetCm !== 0) return { label:'Kalibrasi awal', tone:'waiting', note:`Offset ${fmtSigned(frame.offsetCm)} cm sudah diisi, tetapi belum dikonfirmasi firmware.` };
-  return { label:'Belum dikalibrasi', tone:'waiting', note:'Offset masih 0.0 cm; lakukan kalibrasi fisik sebelum menandai selesai.' };
+  if (measureState === 'measuring') return { label:'Sedang kalibrasi...', tone:'waiting', note:'ESP32 sedang mengumpulkan 20 sampel dan menghitung median.' };
+  if (measureState === 'error') return { label:'Gagal kalibrasi', tone:'alarm', note: measureError || 'Data tinggi badan gagal diverifikasi.' };
+  if (!frame) return { label:'Belum diukur', tone:'waiting', note:'Klik tombol Ukur Tinggi Badan untuk memulai kalibrasi.' };
+  if (frame.calibrated) return { label:'Terkalibrasi', tone:'good', note:`Median ${frame.validSamples} sampel dengan offset ${fmtSigned(frame.offsetCm)} cm telah diverifikasi firmware.` };
+  return { label:'Belum terkalibrasi', tone:'waiting', note:'Data belum melalui verifikasi kalibrasi firmware.' };
 }
 
 function buzzerInfo(frame) {
-  if (!frame) return { label:'Pembacaan tidak valid', tone:'waiting', note:'Buzzer tidak aktif tanpa pembacaan valid.' };
+  if (!frame) return { label:'Siaga', tone:'waiting', note:'Buzzer akan berbunyi setelah pengukuran selesai diverifikasi.' };
   if (frame.buzzerAlarm) return { label:'Alarm aktif', tone:'alarm', note:'Estimasi tinggi di bawah 100 cm; buzzer dikendalikan firmware ESP32.' };
   return { label:'Normal', tone:'good', note:'Estimasi tinggi 100 cm atau lebih; buzzer normal.' };
 }
 
 function frameAgeText() {
-  if (!lastFrameAt) {
-    if (latestFrame?.status === 'invalid') return 'Pembacaan tidak valid diterima';
-    return getConnectionState() === 'connected' ? 'Menunggu baris data dari ESP32' : 'Menunggu koneksi broker';
+  if (measureState === 'measuring') {
+    return 'Sedang mengambil 20 sampel & menghitung median di ESP32...';
+  }
+  if (measureState === 'error') {
+    return measureError || 'Pengukuran gagal diverifikasi. Silakan ulangi.';
+  }
+  if (!lastFrameAt || !frameNow()) {
+    return getConnectionState() === 'connected'
+      ? 'Klik "Ukur Tinggi Badan" untuk mengambil data terkalibrasi'
+      : 'Menunggu koneksi broker MQTT';
   }
   const age = Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000));
   const relative = age === 0 ? 'baru saja' : age < 60 ? `${age} detik lalu` : `${Math.round(age / 60)} menit lalu`;
-  return latestFrame?.status === 'invalid' ? `Pembacaan tidak valid · ${relative}` : `Pembacaan terakhir ${relative}`;
+  return `Hasil kalibrasi diterima ${relative}`;
 }
 
 function captureState() {
   const frame = frameNow();
-  if (getConnectionState() !== 'connected') return { ready:false, label:'Broker MQTT belum terhubung', tone:'waiting' };
-  if (!isLive()) return { ready:false, label:'Menunggu telemetri ESP32', tone:'waiting' };
-  if (latestFrame?.status === 'invalid') return { ready:false, label:'Pembacaan tidak valid', tone:'alarm' };
-  if (!frame) return { ready:false, label:'Menunggu data valid', tone:'waiting' };
-  if (!selectedVisitorId) return { ready:false, label:'Pilih member', tone:'waiting' };
-  if (frame.sequence != null && frame.sequence === lastSavedSequence) return { ready:false, label:'Pembacaan ini sudah disimpan', tone:'good' };
-  return { ready:true, label:'Siap disimpan ke profil member', tone:'good' };
+  if (measureState === 'measuring') return { ready:false, label:'Sedang mengukur & kalibrasi (20 sampel)...', tone:'waiting' };
+  if (measureState === 'error') return { ready:false, label: measureError || 'Kalibrasi gagal, silakan ukur ulang', tone:'alarm' };
+  if (!frame) {
+    if (getConnectionState() !== 'connected') return { ready:false, label:'Broker MQTT belum terhubung', tone:'waiting' };
+    return { ready:false, label:'Klik "Ukur Tinggi Badan" terlebih dahulu', tone:'waiting' };
+  }
+  if (!selectedVisitorId) return { ready:false, label:'Pilih member atau daftarkan member baru', tone:'waiting' };
+  if (frame.sequence != null && frame.sequence === lastSavedSequence) return { ready:false, label:'Hasil kalibrasi ini sudah disimpan', tone:'good' };
+  return { ready:true, label:'Terkalibrasi & siap disimpan ke profil member', tone:'good' };
+}
+
+function measureStatusBanner() {
+  const frame = frameNow();
+  if (measureState === 'measuring') {
+    return `<div class="measure-status-bar measuring" role="status" aria-busy="true"><strong>Mengukur & kalibrasi...</strong><span>ESP32 sedang mengambil 20 sampel untuk menghitung median. Mohon berdiri diam di bawah sensor.</span></div>`;
+  }
+  if (measureState === 'error') {
+    return `<div class="measure-status-bar error" role="alert"><strong>Pengukuran gagal</strong><span>${escape(measureError || 'Data tinggi badan tidak stabil atau orang tidak terdeteksi. Silakan coba lagi.')}</span></div>`;
+  }
+  if (frame) {
+    return `<div class="measure-status-bar calibrated" role="status"><strong>Data terkalibrasi siap digunakan</strong><span>Tinggi badan ${fmt(frame.heightCm)} cm (median ${frame.validSamples} sampel) siap diisi ke data diri member.</span></div>`;
+  }
+  return `<div class="measure-status-bar idle"><strong>Mode pengukuran on-demand</strong><span>Data hanya dikirim via MQTT setelah tombol Ukur Tinggi Badan ditekan dan 20 sampel terverifikasi.</span></div>`;
 }
 
 function summaryCell(label, value, unit, note) {
@@ -241,7 +270,7 @@ function liveReadout(prefix = 'live') {
   const initialDistance = frame ? `${fmt(frame.distanceCm)} cm` : '— cm';
   const initialReference = frame ? `${fmt(frame.referenceHeightCm)} cm` : '— cm';
   const initialOffset = frame ? `${fmtSigned(frame.offsetCm)} cm` : '— cm';
-  const initialSamples = frame ? `${frame.validSamples}/5` : '—';
+  const initialSamples = frame ? `${frame.validSamples} sampel` : '—';
   return `<div class="live-readout" id="${prefix}-readout">
     <div class="live-primary">
       <div class="live-reading">
@@ -365,26 +394,34 @@ function measurementPage() {
 
 function heightMeasurementView() {
   const readiness = captureState();
+  const isMeasuring = measureState === 'measuring';
+  const canMeasure = getConnectionState() === 'connected' && !isMeasuring;
+  const frame = frameNow();
   return `<div class="measurement-layout">
       <section class="panel instrument-panel device-panel">
-        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>MQTT Cloud · Dual MFRC522</p></div>${statusPill()}</div>
+        <div class="panel-header"><div><p class="instrument-kicker">Kolom instrumen · Perangkat fisik</p><h2>ESP32 · HC-SR04 · Dual RFID</h2><p>MQTT Cloud · Kalibrasi 20 Sampel Median</p></div>${statusPill()}</div>
         <div class="device-controls">
-          <button class="btn primary" id="mqtt-settings" data-action="open-mqtt-settings">${svg('settings')} Pengaturan Broker</button>
-          <button class="btn" id="reconnect-mqtt" data-action="reconnect-mqtt">Sambung Ulang</button>
+          <button type="button" class="btn primary" id="btn-measure-height" data-action="trigger-measure" ${canMeasure ? '' : 'disabled'}>${svg('ruler')} ${isMeasuring ? 'Mengukur & Kalibrasi...' : 'Ukur Tinggi Badan'}</button>
+          <button type="button" class="btn" id="mqtt-settings" data-action="open-mqtt-settings">${svg('settings')} Pengaturan Broker</button>
+          <button type="button" class="btn" id="reconnect-mqtt" data-action="reconnect-mqtt">Sambung Ulang</button>
         </div>
-        <p class="device-note" id="mqtt-help">ESP32 mengirim data sensor secara nirkabel melalui Wi-Fi. Dashboard terhubung via Secure WebSockets (WSS).</p>
+        <div id="measure-status-region" aria-live="polite">${measureStatusBanner()}</div>
+        <p class="device-note" id="mqtt-help">Tekan <strong>Ukur Tinggi Badan</strong> untuk memicu kalibrasi 20 sampel (median) di ESP32. Data hanya dikirim via MQTT setelah terverifikasi.</p>
         ${liveReadout('measure')}
       </section>
       <section class="panel capture-panel">
-        <div class="panel-header"><div><p class="eyebrow">Pencatatan & Validasi</p><h2>Pengukuran & Akses Wahana</h2><p>Pilih member, simpan tinggi live, dan validasi syarat wahana.</p></div></div>
+        <div class="panel-header"><div><p class="eyebrow">Pencatatan & Validasi</p><h2>Pengukuran & Akses Wahana</h2><p>Gunakan hasil tinggi terkalibrasi untuk pengisian data diri member dan validasi wahana.</p></div></div>
         <div class="capture-body">
-          <div class="field"><label for="measurement-visitor">Member Terpilih <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih member</option>${memberOptions()}</select><p class="field-help">${state.visitors.length ? 'Pilih member atau dekatkan kartu ke Reader 1 / Reader 2.' : 'Belum ada member terdaftar.'} <button type="button" class="text-button inline" data-action="add-member">+ Tambah member baru</button></p></div>
+          <div class="field"><label for="measurement-visitor">Member Terpilih <span class="req">*</span></label><select id="measurement-visitor"><option value="">Pilih member</option>${memberOptions()}</select><p class="field-help">${state.visitors.length ? 'Pilih member atau dekatkan kartu ke Reader 1 / Reader 2.' : 'Belum ada member terdaftar.'} <button type="button" class="text-button inline" data-action="add-member">${frame ? '+ Isi data diri member baru dengan tinggi ini' : '+ Tambah member baru'}</button></p></div>
           <div class="capture-readout" aria-label="Data hasil pembacaan">
-            <div class="capture-row"><span>Hasil tinggi dari ESP32</span><strong id="capture-height">— cm</strong></div>
-            <div class="capture-row"><span>Jarak sensor</span><strong id="capture-distance">— cm</strong></div>
+            <div class="capture-row"><span>Hasil tinggi terkalibrasi</span><strong id="capture-height">${frame ? `${fmt(frame.heightCm)} cm` : '— cm'}</strong></div>
+            <div class="capture-row"><span>Jarak sensor (median)</span><strong id="capture-distance">${frame ? `${fmt(frame.distanceCm)} cm` : '— cm'}</strong></div>
             <div class="capture-row"><span>Status validitas</span><strong class="capture-validity ${readiness.tone}" id="capture-validity">${readiness.label}</strong></div>
           </div>
-          <button class="btn primary full" data-action="save-reading" id="save-reading" ${readiness.ready ? '' : 'disabled'}>${svg('check')} Simpan hasil ukur ke profil member</button>
+          <div class="capture-actions">
+            <button type="button" class="btn primary full" data-action="save-reading" id="save-reading" ${readiness.ready ? '' : 'disabled'}>${svg('check')} Simpan hasil ukur ke profil member</button>
+            <button type="button" class="btn full" data-action="add-member" id="btn-register-with-height">${svg('plus')} ${frame ? `Isi Data Diri Member Baru (${fmt(frame.heightCm)} cm)` : 'Isi Data Diri Member Baru'}</button>
+          </div>
 
           <div class="ride-validation-section">
             <div class="field">
@@ -392,19 +429,19 @@ function heightMeasurementView() {
               <select id="ride-selector">${rideOptions()}</select>
               <p class="field-help">Tap kartu di <strong>Reader 2</strong> untuk verifikasi instan atau klik tombol di bawah.</p>
             </div>
-            <button class="btn full" data-action="manual-validate" id="btn-manual-validate">${svg('database')} Uji Validasi Akses Wahana</button>
+            <button type="button" class="btn full" data-action="manual-validate" id="btn-manual-validate">${svg('database')} Uji Validasi Akses Wahana</button>
             <div id="validation-banner-region">${validationBannerView()}</div>
           </div>
         </div>
       </section>
     </div>
     <section class="panel guide-panel">
-      <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Dual RFID & Logika Wahana</h2></div><span class="guide-formula">tinggi = Href − (jarak + offset)</span></div>
+      <div class="panel-header"><div><p class="eyebrow">Panduan operasional</p><h2>Alur Kalibrasi & Dual RFID</h2></div><span class="guide-formula">tinggi = median(20 sampel) + offset</span></div>
       <dl class="guide-grid">
-        <div class="guide-item"><dt>Reader 1 (VSPI)</dt><dd>Pos Pendaftaran: Kartu baru yang di-tap langsung membuka form registrasi member.</dd></div>
+        <div class="guide-item"><dt>Tombol Ukur Tinggi Badan</dt><dd>Mengirim perintah kalibrasi ke ESP32 via MQTT. Sensor mengambil 20 sampel, menghitung median, lalu memverifikasi kestabilan.</dd></div>
+        <div class="guide-item"><dt>Reader 1 (VSPI)</dt><dd>Pos Pendaftaran: Kartu baru yang di-tap langsung membuka form registrasi member dengan tinggi terkalibrasi siap diisi.</dd></div>
         <div class="guide-item"><dt>Reader 2 (HSPI)</dt><dd>Pos Akses Wahana: Kartu yang di-tap langsung divalidasi dengan batas tinggi wahana terpilih.</dd></div>
-        <div class="guide-item"><dt>Sinyal Buzzer ESP32</dt><dd>ESP32 membunyikan 1x bip normal jika lolos, atau 3x bip peringatan jika tinggi kurang.</dd></div>
-        <div class="guide-item"><dt>Database Supabase</dt><dd>Data member dan log kelayakan wahana tersimpan di PostgreSQL cloud secara real-time.</dd></div>
+        <div class="guide-item"><dt>Database Supabase</dt><dd>Data member dan hasil ukur terkalibrasi tersimpan di PostgreSQL cloud secara sinkron.</dd></div>
       </dl>
     </section>`;
 }
@@ -439,7 +476,7 @@ function filteredMeasurements() {
 function measurementLedger(rows) {
   if (!state.measurements.length) return '<div class="empty"><strong>Belum ada hasil pengukuran.</strong>Koneksi MQTT aktif melalui pos pengukuran, pilih member, lalu simpan pembacaan pertama.<br><a class="text-button" href="#pengukuran">Buka pengukuran</a></div>';
   if (!rows.length) return '<div class="empty"><strong>Tidak ada data yang cocok.</strong>Ubah rentang tanggal atau filter, lalu coba lagi.<br><button class="text-button" data-action="clear-filter">Reset semua filter</button></div>';
-  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan member</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama member</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong member-name">${escape(row.visitorName)}</span>${row.memberRfid ? `<span class="row-note"><code class="rfid-badge">${escape(row.memberRfid)}</code></span>` : ''}</td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples}/5 sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
+  return `<p class="table-scroll-note">Geser tabel ke samping untuk melihat kolom lainnya.</p><div class="table-scroll"><table class="ledger-table"><caption class="sr-only">Ledger pengukuran tinggi badan member</caption><thead><tr><th>Tanggal dan waktu</th><th>Nama member</th><th class="numeric">Tinggi badan</th><th class="numeric">Jarak sensor</th><th>Status pengukuran</th><th>Status kalibrasi</th></tr></thead><tbody>${rows.map(row => `<tr><td><span class="cell-strong">${when(row.capturedAt)}</span><span class="row-note">WIB</span></td><td><span class="cell-strong member-name">${escape(row.visitorName)}</span>${row.memberRfid ? `<span class="row-note"><code class="rfid-badge">${escape(row.memberRfid)}</code></span>` : ''}</td><td class="numeric"><strong>${fmt(row.heightCm)} cm</strong><span class="row-note">Href ${fmt(row.referenceHeightCm)} · offset ${fmtSigned(row.offsetCm)}</span></td><td class="numeric">${fmt(row.distanceCm)} cm<span class="row-note">${row.validSamples} sampel valid</span></td><td><span class="status good">Valid</span><span class="row-note">${row.buzzerAlarm ? 'Ambang buzzer aktif' : 'Buzzer normal'}</span></td><td><span class="status ${row.calibrated ? 'good' : 'waiting'}">${row.calibrated ? 'Terkalibrasi' : 'Belum terkalibrasi'}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function historyMeta(rows) {
@@ -491,16 +528,16 @@ function render() {
 
 function updateConnectionUI() {
   const conn = getConnectionState();
-  const live = isLive();
-  const stateText = conn !== 'connected' ? 'Offline' : live ? 'ESP32 Live' : 'Menunggu data';
+  const online = isLive();
+  const stateText = conn !== 'connected' ? 'Offline' : online ? 'ESP32 Siap' : 'Menunggu ESP32';
   $$('.pill').forEach(element => {
-    element.className = `pill ${conn !== 'connected' ? 'offline' : live ? 'online' : 'waiting'}`;
+    element.className = `pill ${conn !== 'connected' ? 'offline' : online ? 'online' : 'waiting'}`;
     element.innerHTML = `<i></i><span>${stateText}</span>`;
     element.title = conn !== 'connected'
       ? 'Broker MQTT terputus. Klik untuk membuka pengaturan broker.'
-      : live
-        ? 'ESP32 Live via MQTT. Klik untuk opsi koneksi.'
-        : 'Broker terhubung, menunggu data dari ESP32.';
+      : online
+        ? 'ESP32 Siap via MQTT (kalibrasi on-demand). Klik untuk opsi koneksi.'
+        : 'Broker terhubung, menunggu status online ESP32.';
     if (element.tagName === 'BUTTON') {
       element.dataset.action = 'open-mqtt-settings';
     }
@@ -515,7 +552,9 @@ function updateConnectionUI() {
   }
 
   const frame = frameNow();
-  const link = { label: conn === 'connected' ? 'Terhubung' : 'Terputus', tone: conn === 'connected' ? 'good' : 'waiting' };
+  const isMeasuring = measureState === 'measuring';
+  const canMeasure = conn === 'connected' && !isMeasuring;
+  const link = { label: conn === 'connected' ? (online ? 'Siap' : 'Broker OK') : 'Terputus', tone: conn === 'connected' ? 'good' : 'waiting' };
   const sensor = sensorInfo();
   const calibration = calibrationInfo(frame);
   const buzzer = buzzerInfo(frame);
@@ -527,12 +566,42 @@ function updateConnectionUI() {
     setText(`${prefix}-distance`, frame ? `${fmt(frame.distanceCm)} cm` : '— cm');
     setText(`${prefix}-reference`, frame ? `${fmt(frame.referenceHeightCm)} cm` : '— cm');
     setText(`${prefix}-offset`, frame ? `${fmtSigned(frame.offsetCm)} cm` : '— cm');
-    setText(`${prefix}-samples`, frame ? `${frame.validSamples}/5` : '—');
+    setText(`${prefix}-samples`, frame ? `${frame.validSamples} sampel` : '—');
     setText(`${prefix}-last`, ageText);
     setDeviceStatus(`${prefix}-device-status`, link.label, link.tone);
     setDeviceStatus(`${prefix}-sensor-status`, sensor.label, sensor.tone);
     setDeviceStatus(`${prefix}-alarm`, buzzer.label, buzzer.tone, buzzer.note);
     setStatus(`${prefix}-calibration`, calibration.label, calibration.tone, calibration.note);
+  }
+
+  const measureBtn = $('#btn-measure-height');
+  if (measureBtn) {
+    measureBtn.disabled = !canMeasure;
+    measureBtn.innerHTML = `${svg('ruler')} ${isMeasuring ? 'Mengukur & Kalibrasi...' : 'Ukur Tinggi Badan'}`;
+  }
+  setHtml('measure-status-region', measureStatusBanner());
+
+  const regBtn = $('#btn-register-with-height');
+  if (regBtn) {
+    regBtn.innerHTML = `${svg('plus')} ${frame ? `Isi Data Diri Member Baru (${fmt(frame.heightCm)} cm)` : 'Isi Data Diri Member Baru'}`;
+  }
+
+  const modalMeasureBtn = $('#modal-measure-btn');
+  if (modalMeasureBtn) {
+    modalMeasureBtn.disabled = !canMeasure;
+    modalMeasureBtn.innerHTML = `${svg('ruler')} ${isMeasuring ? 'Mengukur...' : (frame ? 'Ukur Ulang' : 'Ukur Tinggi Badan')}`;
+  }
+  const modalHeightPreview = $('#modal-height-preview');
+  if (modalHeightPreview) {
+    if (isMeasuring) {
+      modalHeightPreview.innerHTML = '<span class="status waiting">Sedang mengukur & kalibrasi 20 sampel...</span>';
+    } else if (measureState === 'error') {
+      modalHeightPreview.innerHTML = `<span class="status alarm">${escape(measureError || 'Gagal kalibrasi, silakan ulangi.')}</span>`;
+    } else if (frame) {
+      modalHeightPreview.innerHTML = `<strong>${fmt(frame.heightCm)} cm</strong> <span class="status good">Terkalibrasi (median ${frame.validSamples} sampel)</span>`;
+    } else {
+      modalHeightPreview.innerHTML = '<span class="status waiting">Belum diukur (klik Ukur Tinggi Badan)</span>';
+    }
   }
 
   const readiness = captureState();
@@ -546,6 +615,39 @@ function updateConnectionUI() {
     const className = `capture-validity ${readiness.tone}`;
     if (validity.className !== className) validity.className = className;
   }
+}
+
+async function triggerHeightMeasurement() {
+  if (measureState === 'measuring') return;
+  if (getConnectionState() !== 'connected') {
+    toast('Broker MQTT belum terhubung. Periksa koneksi terlebih dahulu.', true);
+    return;
+  }
+
+  clearTimeout(measureTimeoutId);
+  measureState = 'measuring';
+  measureError = '';
+  updateConnectionUI();
+
+  const sent = await sendMeasureCommand('start');
+  if (!sent) {
+    measureState = 'error';
+    measureError = 'Gagal mengirim perintah ukur ke broker MQTT.';
+    updateConnectionUI();
+    toast(measureError, true);
+    return;
+  }
+
+  toast('Perintah ukur dikirim ke ESP32. Mohon berdiri diam di bawah sensor untuk kalibrasi 20 sampel.');
+
+  measureTimeoutId = setTimeout(() => {
+    if (measureState === 'measuring') {
+      measureState = 'error';
+      measureError = 'Waktu pengukuran habis. Pastikan ESP32 aktif dan orang berdiri di bawah sensor.';
+      updateConnectionUI();
+      toast(measureError, true);
+    }
+  }, 15000);
 }
 
 async function handleRideValidation(member, readerId = 2) {
@@ -660,7 +762,16 @@ function openMqttModal() {
 
 function memberForm(prefillRfid = '') {
   const initialRfid = prefillRfid || lastScannedRfid || '';
-  openModal('Tambah member baru', 'Registrasi kartu fisik RFID dan identitas member. Tinggi badan diukur otomatis dari sensor.', `<form id="member-form" class="form-grid" novalidate>
+  const frame = frameNow();
+  const isMeasuring = measureState === 'measuring';
+  const canMeasure = getConnectionState() === 'connected' && !isMeasuring;
+  const initialPreview = isMeasuring
+    ? '<span class="status waiting">Sedang mengukur & kalibrasi 20 sampel...</span>'
+    : frame
+      ? `<strong>${fmt(frame.heightCm)} cm</strong> <span class="status good">Terkalibrasi (median ${frame.validSamples} sampel)</span>`
+      : '<span class="status waiting">Belum diukur (klik Ukur Tinggi Badan)</span>';
+
+  openModal('Tambah member baru', 'Registrasi kartu fisik RFID dan data diri member. Tinggi badan diambil dari hasil kalibrasi sensor.', `<form id="member-form" class="form-grid" novalidate>
     <div id="form-error" role="alert"></div>
     <div class="field">
       <label for="member-rfid">UID Kartu RFID <span class="req">*</span></label>
@@ -673,8 +784,16 @@ function memberForm(prefillRfid = '') {
       <div class="field"><label for="member-gender">Jenis kelamin</label><select id="member-gender" name="gender"><option value="">Belum diisi</option><option value="L">Laki-laki</option><option value="P">Perempuan</option><option value="Lainnya">Lainnya</option></select></div>
       <div class="field"><label for="member-weight">Berat badan (kg)</label><input id="member-weight" name="weightKg" type="number" min="1" max="300" step="0.1" placeholder="60"></div>
     </div>
+    <div class="field">
+      <label>Tinggi badan terkalibrasi (sensor)</label>
+      <div class="member-height-box">
+        <div class="member-height-value" id="modal-height-preview" aria-live="polite">${initialPreview}</div>
+        <button type="button" class="btn" id="modal-measure-btn" data-action="trigger-measure" ${canMeasure ? '' : 'disabled'}>${svg('ruler')} ${isMeasuring ? 'Mengukur...' : (frame ? 'Ukur Ulang' : 'Ukur Tinggi Badan')}</button>
+      </div>
+      <p class="field-help">Jika sudah terkalibrasi, tinggi badan akan otomatis tersimpan ke data diri member ini.</p>
+    </div>
     <div class="field"><label for="member-notes">Catatan</label><textarea id="member-notes" name="notes" rows="3" maxlength="500" placeholder="Catatan member (opsional)"></textarea></div>
-    <p class="form-note">Kartu RFID berfungsi sebagai tiket akses member. Tinggi badan akan diukur melalui sensor ultrasonik pada pos ukur.</p>
+    <p class="form-note">Kartu RFID berfungsi sebagai tiket akses member. Data tinggi badan hanya diterima setelah kalibrasi 20 sampel terverifikasi.</p>
     <div class="modal-actions"><button type="button" class="btn" data-action="close-modal">Batal</button><button class="btn primary" type="submit">Simpan member</button></div>
   </form>`);
   $('#member-form')?.addEventListener('submit', async event => {
@@ -682,16 +801,32 @@ function memberForm(prefillRfid = '') {
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
       let member;
-      commit(next => { member = addMember(next, data); });
+      let attachedEntry = null;
+      const calibrated = frameNow();
+      const canAttachHeight = Boolean(calibrated && (calibrated.sequence == null || calibrated.sequence !== lastSavedSequence));
+      commit(next => {
+        member = addMember(next, data);
+        if (canAttachHeight) {
+          attachedEntry = recordMeasurement(next, member.id, calibrated);
+        }
+      });
+      if (attachedEntry && calibrated?.sequence != null) {
+        lastSavedSequence = calibrated.sequence;
+      }
       selectedVisitorId = member.id;
       modal.close();
       render();
       if (route !== 'pengukuran') location.hash = 'pengukuran';
-      toast(`Member ${member.name} (${member.rfidUid}) tersimpan.`);
+      toast(attachedEntry
+        ? `Member ${member.name} (${member.rfidUid}) tersimpan dengan tinggi terkalibrasi ${fmt(attachedEntry.heightCm)} cm.`
+        : `Member ${member.name} (${member.rfidUid}) tersimpan.`);
 
       // Sinkronkan ke Supabase jika aktif
       if (supabaseStatus === 'connected') {
         const synced = await upsertSupabaseMember(member);
+        if (synced && attachedEntry && member.rfidUid) {
+          await updateSupabaseMemberHeight(member.rfidUid, attachedEntry.heightCm, attachedEntry.capturedAt);
+        }
         if (synced) toast(`Member ${member.name} tersimpan ke Supabase Cloud.`);
       }
     } catch (error) {
@@ -899,6 +1034,7 @@ document.addEventListener('click', event => {
     }
   }
   else if (action === 'open-mqtt-settings') openMqttModal();
+  else if (action === 'trigger-measure') void triggerHeightMeasurement();
   else if (action === 'reconnect-mqtt') {
     toast('Menghubungkan ulang ke broker MQTT…');
     void connectMqtt();
@@ -996,9 +1132,31 @@ function initMqtt() {
     updateConnectionUI();
   });
   onTelemetry(frame => {
-    latestFrame = frame;
-    lastFrameAt = Date.now();
-    updateConnectionUI();
+    clearTimeout(measureTimeoutId);
+    measureTimeoutId = null;
+
+    if (frame.status === 'ok' && frame.calibrated === true) {
+      latestFrame = frame;
+      lastFrameAt = Date.now();
+      measureState = 'calibrated';
+      measureError = '';
+      updateConnectionUI();
+      toast(`Tinggi badan terkalibrasi diterima: ${fmt(frame.heightCm)} cm (median ${frame.validSamples} sampel).`);
+      return;
+    }
+
+    if (frame.status === 'invalid') {
+      latestFrame = frame;
+      lastFrameAt = Date.now();
+      measureState = 'error';
+      measureError = frame.error || 'Pengukuran tinggi badan gagal diverifikasi.';
+      updateConnectionUI();
+      toast(measureError, true);
+      return;
+    }
+
+    // Abaikan data non-kalibrasi agar hanya data terverifikasi yang masuk ke pengisian member
+    console.info('[MQTT] Mengabaikan frame belum terkalibrasi:', frame);
   });
   onRfidReader1(rfidEvent => {
     handleRfidEventReader1(rfidEvent);

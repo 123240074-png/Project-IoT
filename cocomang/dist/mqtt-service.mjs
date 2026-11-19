@@ -9,6 +9,7 @@ import {
   parseTelemetryMessage,
   parseRfidMessage,
   buildBuzzerPayload,
+  buildMeasurePayload,
 } from './mqtt-protocol.mjs';
 
 export const MQTT_CONFIG_KEY = 'cocomang-mqtt-config-v1';
@@ -266,6 +267,30 @@ export async function sendBuzzerCommand(cmd) {
     mqttClient.publish(topics.buzzerCmd, payload, { qos: 0 }, (err) => {
       if (err) {
         console.warn('[MQTT] Gagal mem-publish perintah buzzer:', err);
+        resolve(false);
+      } else {
+        resolve(true);
+      }
+    });
+  });
+}
+
+/**
+ * Mengirimkan perintah ukur & kalibrasi tinggi badan ke ESP32 via MQTT
+ */
+export async function sendMeasureCommand(cmd = 'start') {
+  const payload = buildMeasurePayload(cmd);
+  if (!payload) return false;
+  if (!mqttClient || connectionState !== 'connected') {
+    console.warn('[MQTT] Tidak dapat mengirim perintah ukur: broker belum terhubung.');
+    return false;
+  }
+
+  const topics = getMqttTopics(getMqttConfig().topicPrefix);
+  return new Promise((resolve) => {
+    mqttClient.publish(topics.measureCmd, payload, { qos: 0 }, (err) => {
+      if (err) {
+        console.warn('[MQTT] Gagal mem-publish perintah ukur:', err);
         resolve(false);
       } else {
         resolve(true);

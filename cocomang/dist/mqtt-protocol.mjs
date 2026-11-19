@@ -25,6 +25,7 @@ export function getMqttTopics(prefix = DEFAULT_MQTT_CONFIG.topicPrefix) {
     rfidReader1: `${cleanPrefix}/rfid/reader1`,
     rfidReader2: `${cleanPrefix}/rfid/reader2`,
     buzzerCmd: `${cleanPrefix}/cmd/buzzer`,
+    measureCmd: `${cleanPrefix}/cmd/measure`,
     deviceStatus: `${cleanPrefix}/status`,
   };
 }
@@ -123,6 +124,18 @@ export function buildBuzzerPayload(cmd) {
   const char = String(cmd || '').trim().toLowerCase();
   if (char === 'b' || char === 'n') {
     return char;
+  }
+  return null;
+}
+
+/**
+ * Validasi dan format perintah pengukuran + kalibrasi tinggi badan ke ESP32
+ * Menerima 'start', 'measure', atau 'y' -> dinormalisasi ke 'start'
+ */
+export function buildMeasurePayload(cmd = 'start') {
+  const token = String(cmd || '').trim().toLowerCase();
+  if (token === 'start' || token === 'measure' || token === 'y') {
+    return 'start';
   }
   return null;
 }
