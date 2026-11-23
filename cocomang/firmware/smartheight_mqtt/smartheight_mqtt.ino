@@ -1,8 +1,8 @@
 /*
-  SMART HEIGHT MEASUREMENT SYSTEM - PURE MQTT WIRELESS EDITION (CALIBRATED ON-DEMAND)
-  ESP32 DevKit V1 + Dual RFID RC522 (VSPI & HSPI) + HC-SR04 + Buzzer Pasif
+  SMART HEIGHT MEASUREMENT SYSTEM - PURE MQTT WIRELESS EDITION (CALIBRATED ON-DEMAND + LCD I2C)
+  ESP32 DevKit V1 + Dual RFID RC522 (VSPI & HSPI) + HC-SR04 + Buzzer Pasif + LCD 16x2 I2C
 
-  Perubahan pada versi ini (pengukuran tinggi badan terkalibrasi):
+  Perubahan pada versi ini (pengukuran tinggi badan terkalibrasi + LCD I2C):
   - Tinggi referensi (jarak sensor ke lantai) tetap 200 cm (REFERENCE_HEIGHT_CM).
   - Data tinggi badan TIDAK dikirim ke MQTT secara realtime/periodik.
   - Pengukuran & kalibrasi dipicu oleh tombol "Ukur Tinggi Badan" dari website
@@ -11,6 +11,9 @@
     memverifikasi kestabilan data (rentang IQR <= 5 cm & rentang tinggi valid).
   - Data hanya dipublish ke MQTT (<MQTT_TOPIC_PREFIX>/telemetry) setelah
     terkalibrasi dan terverifikasi sesuai (calibrated: true).
+  - LCD 16x2 I2C menampilkan status booting, Wi-Fi, Broker MQTT, standby,
+    animasi "Memulai Proses...", progres 1-100%, hasil "Tinggi Badan: xxx cm",
+    notifikasi RFID, serta error handling non-blocking.
 
   Arsitektur Komunikasi:
   - ESP32 terhubung ke Wi-Fi dan MQTT Cloud Broker (default: broker.emqx.io:1883).
@@ -31,10 +34,14 @@
       SCK  -> GPIO 14, MISO -> GPIO 32 (remapped), MOSI -> GPIO 13, SS -> GPIO 4, RST -> GPIO 21
   - HC-SR04: TRIG -> GPIO 25, ECHO -> GPIO 26 (voltage divider 1k / 2k)
   - Buzzer Pasif: SIGNAL -> GPIO 27, GND -> GND (2.000 Hz)
+  - LCD 16x2 I2C (PCF8574): SDA -> GPIO 16, SCL -> GPIO 17, VCC -> 5V (VIN), GND -> GND
+      (Catatan: GPIO 34 & 35 pada ESP32 bersifat INPUT-ONLY sehingga tidak dapat dipakai untuk I2C)
 */
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "config.h"
@@ -64,6 +71,13 @@ static const uint8_t PIN_ECHO = 26;
 // --- Buzzer Pasif ---
 static const uint8_t PIN_BUZZER = 27;
 static const uint16_t BUZZER_FREQ_HZ = 2000;
+
+// --- LCD 16x2 I2C (PCF8574) ---
+// GPIO 34 & 35 pada ESP32 adalah INPUT-ONLY; gunakan pin bidirectional seperti GPIO 16 & 17 (atau 33).
+static const uint8_t PIN_LCD_SDA = 33;
+static const uint8_t PIN_LCD_SCL = 15;
+static const uint8_t LCD_COLS    = 16;
+static const uint8_t LCD_ROWS    = 2;
 
 // ============================================================
 // PARAMETER SISTEM & TIMER NON-BLOCKING
@@ -122,6 +136,34 @@ static char topicStatus[80];
 // Inisialisasi Klien Jaringan
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+
+// ============================================================
+// KONTROLER LCD 16x2 I2C (NON-BLOCKING)
+// ============================================================
+enum LcdScreenState : uint8_t {
+  LCD_BOOT = 0,
+  LCD_WIFI_CONNECTING,
+  LCD_MQTT_CONNECTING,
+  LCD_MQTT_CONNECTED,
+  LCD_READY,
+  LCD_MEASURING_WAIT,
+  LCD_MEASURING_PROGRESS,
+  LCD_RESULT,
+  LCD_NOTICE
+};
+
+static LiquidCrystal_I2C lcd(0x27, LCD_COLS, LCD_ROWS);
+static bool           lcdAvailable     = false;
+static LcdScreenState lcdState         = LCD_BOOT;
+static uint32_t       lcdStateStartMs  = 0;
+static uint32_t       lcdNoticeDurMs   = 0;
+static uint32_t       lcdLastAnimMs    = 0;
+static uint8_t        lcdAnimStep      = 0;
+static float          lcdResultHeight  = 0.0f;
+static char           lcdNoticeLine0[17] = "";
+static char           lcdNoticeLine1[17] = "";
+static char           lcdCacheLine0[17]  = "";
+static char           lcdCacheLine1[17]  = "";
 
 // ============================================================
 // DRIVER MFRC522 DUAL-SPI (SPICLASS INDEPENDEN VSPI & HSPI)
@@ -402,6 +444,175 @@ MFRC522_DualSPI rfid1(&vspiBus, PIN_RFID1_SS, PIN_RFID1_RST);
 MFRC522_DualSPI rfid2(&hspiBus, PIN_RFID2_SS, PIN_RFID2_RST);
 
 // ============================================================
+// FUNGSI KONTROLER LCD 16x2 I2C (NON-BLOCKING)
+// ============================================================
+bool i2cDeviceExists(uint8_t address) {
+  Wire.beginTransmission(address);
+  return (Wire.endTransmission() == 0);
+}
+
+void lcdWriteRow(uint8_t row, const char* text, char* cache) {
+  if (!lcdAvailable) return;
+  char padded[17];
+  size_t len = strlen(text);
+  for (uint8_t i = 0; i < 16; i++) {
+    padded[i] = (i < len) ? text[i] : ' ';
+  }
+  padded[16] = '\0';
+
+  if (strncmp(padded, cache, 16) == 0) return;
+  memcpy(cache, padded, 17);
+  lcd.setCursor(0, row);
+  lcd.print(padded);
+}
+
+void lcdWriteLines(const char* line0, const char* line1) {
+  lcdWriteRow(0, line0, lcdCacheLine0);
+  lcdWriteRow(1, line1, lcdCacheLine1);
+}
+
+void initLcd() {
+  Wire.begin(PIN_LCD_SDA, PIN_LCD_SCL);
+  uint8_t detectedAddr = 0;
+  if (i2cDeviceExists(0x27)) {
+    detectedAddr = 0x27;
+  } else if (i2cDeviceExists(0x3F)) {
+    detectedAddr = 0x3F;
+  }
+
+  if (detectedAddr == 0) {
+    lcdAvailable = false;
+    Serial.printf("[LCD] PERINGATAN: LCD I2C tidak terdeteksi di SDA=%u, SCL=%u (0x27/0x3F).\n",
+                  PIN_LCD_SDA, PIN_LCD_SCL);
+    return;
+  }
+
+  if (detectedAddr != 0x27) {
+    lcd = LiquidCrystal_I2C(detectedAddr, LCD_COLS, LCD_ROWS);
+  }
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  memset(lcdCacheLine0, 0, sizeof(lcdCacheLine0));
+  memset(lcdCacheLine1, 0, sizeof(lcdCacheLine1));
+  lcdAvailable = true;
+  Serial.printf("[LCD] OK! LCD 16x2 I2C aktif pada alamat 0x%02X (SDA=%u, SCL=%u)\n",
+                detectedAddr, PIN_LCD_SDA, PIN_LCD_SCL);
+}
+
+void lcdShowImmediate(LcdScreenState state, const char* line0, const char* line1) {
+  lcdState = state;
+  lcdStateStartMs = millis();
+  lcdLastAnimMs = lcdStateStartMs;
+  lcdAnimStep = 0;
+  lcdWriteLines(line0, line1);
+}
+
+void lcdShowNotice(const char* line0, const char* line1, uint32_t durationMs = 3500) {
+  snprintf(lcdNoticeLine0, sizeof(lcdNoticeLine0), "%s", line0);
+  snprintf(lcdNoticeLine1, sizeof(lcdNoticeLine1), "%s", line1);
+  lcdNoticeDurMs = durationMs;
+  lcdState = LCD_NOTICE;
+  lcdStateStartMs = millis();
+  lcdWriteLines(lcdNoticeLine0, lcdNoticeLine1);
+}
+
+void lcdShowResult(float heightCm) {
+  lcdResultHeight = heightCm;
+  lcdState = LCD_RESULT;
+  lcdStateStartMs = millis();
+  char line1[17];
+  snprintf(line1, sizeof(line1), "%.1f cm", heightCm);
+  lcdWriteLines("Tinggi Badan:", line1);
+}
+
+void lcdUpdateProgress(uint8_t count, uint8_t total) {
+  if (!lcdAvailable || total == 0) return;
+  lcdState = LCD_MEASURING_PROGRESS;
+  uint8_t pct = (uint8_t)(((uint16_t)count * 100U) / total);
+  if (pct < 1) pct = 1;
+  if (pct > 100) pct = 100;
+
+  char line0[17];
+  char line1[17];
+  snprintf(line0, sizeof(line0), "Proses: %3u%%", (unsigned)pct);
+
+  // Progress bar 16 karakter: [##############..]
+  uint8_t filled = (uint8_t)(((uint16_t)pct * 14U) / 100U);
+  line1[0] = '[';
+  for (uint8_t i = 0; i < 14; i++) {
+    line1[i + 1] = (i < filled) ? '#' : '.';
+  }
+  line1[15] = ']';
+  line1[16] = '\0';
+
+  lcdWriteLines(line0, line1);
+}
+
+void updateLcd(uint32_t now) {
+  if (!lcdAvailable) return;
+
+  switch (lcdState) {
+    case LCD_MQTT_CONNECTED:
+      if (now - lcdStateStartMs >= 1500) {
+        lcdShowImmediate(LCD_READY, "Smart Height", "Measurement Sys");
+      }
+      break;
+
+    case LCD_READY: {
+      // Scroll teks "Measurement System Ready" pada baris 2 secara non-blocking
+      static const char readyMsg[] = "Measurement System Ready   ";
+      static const uint8_t msgLen = sizeof(readyMsg) - 1;
+      if (now - lcdLastAnimMs >= 320) {
+        lcdLastAnimMs = now;
+        char window[17];
+        for (uint8_t i = 0; i < 16; i++) {
+          window[i] = readyMsg[(lcdAnimStep + i) % msgLen];
+        }
+        window[16] = '\0';
+        lcdWriteLines("Smart Height", window);
+        lcdAnimStep = (lcdAnimStep + 1) % msgLen;
+      }
+      break;
+    }
+
+    case LCD_MEASURING_WAIT:
+      if (now - lcdLastAnimMs >= 350) {
+        lcdLastAnimMs = now;
+        lcdAnimStep = (lcdAnimStep + 1) % 4;
+        char line1[17];
+        snprintf(line1, sizeof(line1), "Proses%s",
+                 (lcdAnimStep == 0) ? "" :
+                 (lcdAnimStep == 1) ? "." :
+                 (lcdAnimStep == 2) ? ".." : "...");
+        lcdWriteLines("Memulai", line1);
+      }
+      break;
+
+    case LCD_RESULT:
+      if (now - lcdStateStartMs >= 7000) {
+        lcdShowImmediate(LCD_READY, "Smart Height", "Measurement Sys");
+      }
+      break;
+
+    case LCD_NOTICE:
+      if (now - lcdStateStartMs >= lcdNoticeDurMs) {
+        if (WiFi.status() != WL_CONNECTED) {
+          lcdShowImmediate(LCD_WIFI_CONNECTING, "Menghubungkan Ke", "Jaringan Wi-Fi..");
+        } else if (!mqttClient.connected()) {
+          lcdShowImmediate(LCD_MQTT_CONNECTING, "Menghubungkan Ke", "Broker MQTT...");
+        } else {
+          lcdShowImmediate(LCD_READY, "Smart Height", "Measurement Sys");
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ============================================================
 // FUNGSI SUARA BUZZER PASIF
 // ============================================================
 void buzzerTone(uint16_t durationMs) {
@@ -467,6 +678,11 @@ float medianOfBuffer() {
 }
 
 void startFinalMeasurement() {
+  if (finalActive) {
+    Serial.println(F("[KALIBRASI] Pengukuran sedang berlangsung, abaikan pemicu ganda."));
+    return;
+  }
+
   // Reset buffer agar 20 sampel benar-benar baru untuk sesi ukur saat ini
   distCount     = 0;
   distIdx       = 0;
@@ -479,6 +695,7 @@ void startFinalMeasurement() {
   finalCount   = 0;
   finalStartMs = millis();
   lastSampleMs = finalStartMs;
+  lcdShowImmediate(LCD_MEASURING_WAIT, "Memulai", "Proses.");
   Serial.printf("[KALIBRASI] Memulai pengukuran (%u sampel median). Mohon berdiri diam di bawah sensor...\n",
                 (unsigned)FINAL_SAMPLES);
 }
@@ -488,6 +705,15 @@ void abortFinalMeasurement(const char* reason) {
   finalActive = false;
   Serial.printf("[KALIBRASI] GAGAL: %s (terkumpul %u/%u sampel)\n",
                 reason, (unsigned)finalCount, (unsigned)FINAL_SAMPLES);
+
+  if (strstr(reason, "sensor") != nullptr && strstr(reason, "terputus") != nullptr) {
+    lcdShowNotice("Sensor Error!", "Cek HC-SR04", 4000);
+  } else if (strstr(reason, "meninggalkan") != nullptr) {
+    lcdShowNotice("Proses Batal!", "Tetap di tempat", 4000);
+  } else {
+    lcdShowNotice("Gagal: Timeout", "Tidak ada objek", 4000);
+  }
+
   publishInvalidTelemetry(reason);
   buzzerBeepTriple();
 }
@@ -499,6 +725,7 @@ void collectFinalSample(float distCm, float heightCm) {
   finalDistSamples[finalCount]   = distCm;
   finalHeightSamples[finalCount] = heightCm;
   finalCount++;
+  lcdUpdateProgress(finalCount, FINAL_SAMPLES);
 
   if (finalCount >= FINAL_SAMPLES) {
     finalActive = false;
@@ -531,6 +758,7 @@ void collectFinalSample(float distCm, float heightCm) {
 
     if (!rangeValid) {
       Serial.println(F("[KALIBRASI] DITOLAK: Nilai tinggi/jarak di luar rentang valid."));
+      lcdShowNotice("Tinggi Invalid!", "Ulangi Ukur", 4000);
       publishInvalidTelemetry("Tinggi badan di luar rentang valid");
       buzzerBeepTriple();
       return;
@@ -538,6 +766,7 @@ void collectFinalSample(float distCm, float heightCm) {
 
     if (!stableValid) {
       Serial.printf("[KALIBRASI] DITOLAK: Pembacaan tidak stabil (IQR %.2f cm > %.1f cm).\n", iqr, FINAL_MAX_IQR_CM);
+      lcdShowNotice("Data Tdk Stabil", "Ulangi & Diam", 4000);
       publishInvalidTelemetry("Pembacaan tidak stabil, mohon berdiri diam dan ulangi");
       buzzerBeepTriple();
       return;
@@ -549,6 +778,7 @@ void collectFinalSample(float distCm, float heightCm) {
 
     Serial.printf("[KALIBRASI] TERVERIFIKASI -> Mengirim ke MQTT: %.1f cm (jarak: %.1f cm)\n",
                   medianHeight, medianDist);
+    lcdShowResult(medianHeight);
     publishCalibratedTelemetry(medianDist, medianHeight, FINAL_SAMPLES, alarm);
     buzzerBeepSingle();
   }
@@ -617,8 +847,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     char cmd = (char)payload[0];
     Serial.printf("[MQTT CMD] Perintah buzzer diterima: '%c'\n", cmd);
     if (cmd == 'b' || cmd == 'B') {
+      if (!finalActive) lcdShowNotice("Akses Wahana:", "LOLOS!", 3000);
       buzzerBeepSingle();
     } else if (cmd == 'n' || cmd == 'N') {
+      if (!finalActive) lcdShowNotice("Akses Wahana:", "DITOLAK!", 3000);
       buzzerBeepTriple();
     }
     return;
@@ -641,6 +873,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 bool connectMqttBroker() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
+  if (!finalActive && lcdState != LCD_NOTICE && lcdState != LCD_RESULT) {
+    lcdShowImmediate(LCD_MQTT_CONNECTING, "Menghubungkan Ke", "Broker MQTT...");
+  }
   Serial.printf("[MQTT] Menghubungkan ke %s:%d...\n", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
 
   bool connected = false;
@@ -656,32 +891,68 @@ bool connectMqttBroker() {
     mqttClient.subscribe(topicCmdBuzzer);
     mqttClient.subscribe(topicCmdMeasure);
     Serial.printf("[MQTT] Berlangganan ke topik: %s & %s\n", topicCmdBuzzer, topicCmdMeasure);
+    if (!finalActive && lcdState != LCD_RESULT) {
+      lcdShowImmediate(LCD_MQTT_CONNECTED, "Broker MQTT", "Terhubung!");
+    }
     buzzerBeepSingle();
     return true;
   } else {
     Serial.printf("[MQTT] Gagal konek, status=%d\n", mqttClient.state());
+    if (!finalActive) {
+      char errLine[17];
+      snprintf(errLine, sizeof(errLine), "Gagal (rc=%d)", mqttClient.state());
+      lcdShowNotice("Broker Error!", errLine, 3500);
+    }
     return false;
   }
 }
 
 void handleNetworkReconnections(uint32_t now) {
+  static bool wasWifiConnected = false;
+  static bool wasMqttConnected = false;
+
   // 1. Cek Koneksi Wi-Fi
   if (WiFi.status() != WL_CONNECTED) {
+    if (wasWifiConnected) {
+      wasWifiConnected = false;
+      wasMqttConnected = false;
+      if (!finalActive) {
+        lcdShowNotice("Wi-Fi Terputus!", "Menyambung ulang", 3000);
+      }
+    }
     if (now - lastWifiRetryMs >= 5000) {
       lastWifiRetryMs = now;
       Serial.println(F("[WIFI] Menghubungkan ke Wi-Fi..."));
+      if (!finalActive && lcdState != LCD_NOTICE) {
+        lcdShowImmediate(LCD_WIFI_CONNECTING, "Menghubungkan Ke", "Jaringan Wi-Fi..");
+      }
       WiFi.reconnect();
     }
     return;
   }
 
+  if (!wasWifiConnected) {
+    wasWifiConnected = true;
+    Serial.printf("[WIFI] Terhubung! IP: %s\n", WiFi.localIP().toString().c_str());
+    if (!finalActive && !mqttClient.connected()) {
+      lcdShowImmediate(LCD_MQTT_CONNECTING, "Menghubungkan Ke", "Broker MQTT...");
+    }
+  }
+
   // 2. Cek Koneksi MQTT jika Wi-Fi sudah aktif
   if (!mqttClient.connected()) {
+    if (wasMqttConnected) {
+      wasMqttConnected = false;
+      if (!finalActive) {
+        lcdShowNotice("Broker Terputus", "Menyambung ulang", 3000);
+      }
+    }
     if (now - lastMqttRetryMs >= 4000) {
       lastMqttRetryMs = now;
       connectMqttBroker();
     }
   } else {
+    wasMqttConnected = true;
     mqttClient.loop();
   }
 }
@@ -746,6 +1017,12 @@ void publishRfidEvent(uint8_t readerNum, const MFRC522_DualSPI::Uid &uid) {
 
   Serial.printf("[RFID %d] %s -> %s\n", readerNum, labelStr, uidStr);
 
+  if (!finalActive) {
+    char line0[17];
+    snprintf(line0, sizeof(line0), "RFID %d:%s", readerNum, (readerNum == 1) ? "Daftar" : "Wahana");
+    lcdShowNotice(line0, uidStr, 3000);
+  }
+
   if (mqttClient.connected()) {
     const char* targetTopic = (readerNum == 1) ? topicRfid1 : topicRfid2;
     mqttClient.publish(targetTopic, jsonBuffer);
@@ -763,6 +1040,11 @@ void setup() {
   Serial.println(F("================================================================"));
   Serial.println(F("    SMART HEIGHT MEASUREMENT SYSTEM - PURE MQTT WIRELESS        "));
   Serial.println(F("================================================================"));
+
+  // 0. Inisialisasi LCD I2C & tampilkan urutan status booting
+  initLcd();
+  lcdShowImmediate(LCD_BOOT, "Program", "Dijalankan...");
+  delay(1200);
 
   // 1. Format Topik MQTT berdasarkan konfigurasi
   snprintf(topicTelemetry, sizeof(topicTelemetry), "%s/telemetry", MQTT_TOPIC_PREFIX);
@@ -802,14 +1084,28 @@ void setup() {
   }
 
   // 4. Inisialisasi Koneksi Wi-Fi
+  lcdShowImmediate(LCD_WIFI_CONNECTING, "Menghubungkan Ke", "Jaringan Wi-Fi..");
   Serial.printf("[WIFI] Menghubungkan ke SSID: %s...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const uint32_t wifiBootStartMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiBootStartMs) < 12000) {
+    delay(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[WIFI] Timeout saat booting, lanjut mencoba di background..."));
+    lcdShowNotice("Wi-Fi Lambat!", "Cek SSID/Pass", 2500);
+  }
 
   // 5. Inisialisasi Klien MQTT
   mqttClient.setBufferSize(512);
   mqttClient.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
   mqttClient.setCallback(mqttCallback);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    connectMqttBroker();
+  }
 
   buzzerBeepSingle();
   Serial.println(F("[SYSTEM] Inisialisasi selesai. Sistem siap beroperasi!"));
@@ -880,6 +1176,9 @@ void loop() {
       abortFinalMeasurement("Waktu habis, orang tidak terdeteksi di bawah sensor");
     }
   }
+
+  // 5. UPDATE TAMPILAN & ANIMASI LCD NON-BLOCKING
+  updateLcd(millis());
 
   delay(10);
 }
